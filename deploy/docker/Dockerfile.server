@@ -1,0 +1,35 @@
+FROM golang:1.25-alpine AS build
+
+RUN apk add --no-cache build-base
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+	-ldflags "-X syna/internal/buildinfo.Version=${VERSION} -X syna/internal/buildinfo.Commit=${COMMIT} -X syna/internal/buildinfo.BuildDate=${BUILD_DATE}" \
+	-o /out/syna-server ./cmd/syna-server
+
+FROM alpine:3.22
+
+RUN adduser -D -u 10001 syna \
+	&& apk add --no-cache ca-certificates sqlite
+
+WORKDIR /app
+COPY --from=build /out/syna-server /usr/local/bin/syna-server
+
+ENV SYNA_LISTEN=:8080
+ENV SYNA_DATA_DIR=/var/lib/syna
+
+RUN mkdir -p /var/lib/syna /var/lib/syna/objects /var/lib/syna/tmp \
+	&& chown -R syna:syna /var/lib/syna
+
+USER syna
+EXPOSE 8080
+
+ENTRYPOINT ["syna-server"]
+CMD ["serve"]

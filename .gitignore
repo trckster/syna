@@ -1,0 +1,13 @@
+/syna
+/syna-server
+/bin/
+/coverage/
+/tmp/
+/dist/
+*.test
+*.out
+*.log
+*.db
+*.db-*
+client.db
+state.db

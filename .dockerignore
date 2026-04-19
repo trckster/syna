@@ -1,0 +1,17 @@
+.git
+.audit
+.codex
+coverage
+dist
+bin
+tmp
+*.test
+*.out
+*.log
+*.db
+*.db-*
+client.db
+state.db
+.DS_Store
+.idea
+.vscode

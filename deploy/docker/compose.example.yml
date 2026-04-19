@@ -1,0 +1,19 @@
+services:
+  syna-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.server
+    command: ["serve"]
+    restart: unless-stopped
+    environment:
+      SYNA_LISTEN: ":8080"
+      SYNA_DATA_DIR: "/var/lib/syna"
+      SYNA_PUBLIC_BASE_URL: "https://syna.example.com"
+      SYNA_SESSION_TTL: "24h"
+      SYNA_EVENT_RETENTION: "24h"
+      SYNA_ZERO_REF_RETENTION: "168h"
+      SYNA_LOG_LEVEL: "info"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /srv/syna:/var/lib/syna
