@@ -18,15 +18,25 @@ reachable over HTTPS at the same public URL your clients will use, for example
 
 In Coolify:
 
-1. Create a new service from this project repository.
-2. Use the Dockerfile build type.
-3. Set the Dockerfile path to `deploy/docker/Dockerfile.server`.
-4. Set the container command to `serve`.
-5. Expose container port `8080`.
-6. Attach your public domain with HTTPS enabled.
-7. Enable WebSocket support.
-8. Add a persistent volume mounted at `/var/lib/syna`.
-9. Set the health check path to `/readyz`.
+1. Create a new resource and choose `Public Repository` for this project
+   repository. For a private repository, use the appropriate GitHub App or
+   Deploy Key option instead.
+2. After Coolify checks the repository, set the build pack to `Dockerfile`.
+3. Set the base directory to `/`.
+4. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
+5. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
+6. In Domains, set the HTTPS URL clients will use, for example
+   `https://syna.example.com`.
+7. In Persistent Storage, add a Docker volume:
+   - Name: `syna-data`
+   - Source Path: leave empty
+   - Destination Path: `/var/lib/syna`
+8. In Healthcheck, set port to `8080` and path to `/readyz`.
+
+The Dockerfile already starts the server with `syna-server serve`; no Coolify
+start command override or custom Docker option is required. Coolify's normal
+domain/proxy path is sufficient for Syna's WebSocket endpoint; no separate
+WebSocket toggle is required.
 
 Syna has defaults for its server runtime settings, including listen address,
 data directory, session TTLs, retention windows, and HTTP timeouts. For a
@@ -36,6 +46,7 @@ production deployment, set only the public URL clients should use:
 SYNA_PUBLIC_BASE_URL=https://syna.example.com
 ```
 
+This value must match the HTTPS URL configured in Coolify's `Domains` field.
 Do not use container-local ephemeral storage for `/var/lib/syna`; it contains
 the SQLite database and encrypted object store.
 

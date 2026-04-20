@@ -19,20 +19,30 @@ Persistent data under `/var/lib/syna`:
 
 Recommended Coolify settings:
 
-- Service type: Dockerfile
-- Dockerfile path: `deploy/docker/Dockerfile.server`
-- Container command: `serve`
-- Exposed port: `8080`
-- Health check path: `/readyz`
-- WebSocket support: enabled
-- Persistent volume: mount to `/var/lib/syna`
-- Public domain: the same URL you set in `SYNA_PUBLIC_BASE_URL`
+- Resource type: Public Repository
+- Build pack: Dockerfile
+- Base directory: `/`
+- Dockerfile location: `/deploy/docker/Dockerfile.server`
+- Domains: the HTTPS URL you set in `SYNA_PUBLIC_BASE_URL`
+- Ports Exposes: `8080`
+- Port Mappings: leave empty
+- Persistent Storage: add a Docker volume with name `syna-data`, empty source
+  path, and destination path `/var/lib/syna`
+- Healthcheck: enabled, path `/readyz`, port `8080` if Coolify shows a port
+  field
+
+No Coolify command override is required; the Dockerfile already runs
+`syna-server serve`. Leave custom Docker options empty. No separate WebSocket
+toggle is required when using Coolify's normal domain/proxy path.
 
 Required environment variables:
 
+- `SYNA_PUBLIC_BASE_URL=https://syna.example.com`
+
+The image and application already default to:
+
 - `SYNA_LISTEN=:8080`
 - `SYNA_DATA_DIR=/var/lib/syna`
-- `SYNA_PUBLIC_BASE_URL=https://syna.example.com`
 - `SYNA_SESSION_TTL=24h`
 - `SYNA_EVENT_RETENTION=24h`
 - `SYNA_ZERO_REF_RETENTION=168h`
@@ -42,6 +52,9 @@ Required environment variables:
 - `SYNA_IDLE_TIMEOUT=120s`
 
 Do not deploy Syna with container-local ephemeral storage for `/var/lib/syna`.
+If you use a bind mount instead of a Docker volume, set Source Path to a host
+directory such as `/srv/syna`, set Destination Path to `/var/lib/syna`, and
+ensure the host directory is writable by container UID `10001`.
 
 ## Reverse Proxy
 

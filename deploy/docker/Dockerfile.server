@@ -17,7 +17,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
 FROM alpine:3.22
 
 RUN adduser -D -u 10001 syna \
-	&& apk add --no-cache ca-certificates sqlite
+	&& apk add --no-cache ca-certificates curl sqlite
 
 WORKDIR /app
 COPY --from=build /out/syna-server /usr/local/bin/syna-server

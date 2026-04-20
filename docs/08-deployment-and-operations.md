@@ -89,14 +89,25 @@ services:
 
 Coolify configuration requirements:
 
-- service type: Docker image
-- exposed container port: `8080`
-- persistent volume mounted to `/var/lib/syna`
-- domain attached with HTTPS enabled
-- WebSocket support enabled
-- health check path: `/readyz`
+- resource type: Public Repository
+- build pack: Dockerfile
+- base directory: `/`
+- Dockerfile location: `/deploy/docker/Dockerfile.server`
+- Domains: the HTTPS URL clients use
+- Ports Exposes: `8080`
+- Port Mappings: empty
+- Persistent Storage: Docker volume with name `syna-data`, empty source path,
+  and destination path `/var/lib/syna`
+- Healthcheck: enabled, path `/readyz`, port `8080` if Coolify shows a port
+  field
+
+No custom Docker options or separate WebSocket toggle are required when using
+Coolify's normal domain/proxy path.
 
 Do not store SQLite or object data in container-local ephemeral storage.
+If using a bind mount instead of a Docker volume, mount a host directory such
+as `/srv/syna` to `/var/lib/syna` and ensure it is writable by container UID
+`10001`.
 
 ## Backup
 
