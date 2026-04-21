@@ -141,6 +141,9 @@ func TestCLIKeyShowReadsLocalKeyring(t *testing.T) {
 	if stdout, stderr, err = runSyna(t, bin, home, "", "disconnect"); err != nil {
 		t.Fatalf("disconnect: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
+	if !strings.Contains(stdout, "Disconnected this device. Local files were left untouched.") {
+		t.Fatalf("disconnect output missing confirmation:\n%s", stdout)
+	}
 	stdout, stderr, err = runSyna(t, bin, home, "", "key", "show")
 	if err == nil {
 		t.Fatalf("expected key show after disconnect to fail\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
@@ -252,6 +255,9 @@ func TestCLIRealDaemonsSyncCreateEditAndDelete(t *testing.T) {
 
 	if stdout, stderr, err = runSyna(t, bin, homeA, "", "disconnect"); err != nil {
 		t.Fatalf("disconnect A: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Disconnected this device. Local files were left untouched.") {
+		t.Fatalf("disconnect output missing confirmation:\n%s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(rootA, "deep", "note.txt")); err != nil {
 		t.Fatalf("disconnect should leave A's local files untouched: %v", err)

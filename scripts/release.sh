@@ -16,6 +16,7 @@ fi
 
 mkdir -p "${DIST_DIR}"
 rm -f "${DIST_DIR}"/syna-*.tar.gz
+rm -f "${DIST_DIR}"/syna-*-checksums.txt
 
 build_archive() {
   local goarch="$1"
@@ -80,6 +81,10 @@ for arch in ${ARCHES}; do
           echo "missing required C compiler for ${arch}: ${cc}" >&2
           exit 1
         }
+        command -v sha256sum >/dev/null 2>&1 || {
+          echo "missing required checksum tool: sha256sum" >&2
+          exit 1
+        }
       else
         build_archive "${arch}"
       fi
@@ -93,4 +98,9 @@ done
 
 if [[ "${CHECK_DEPS}" == "true" ]]; then
   echo "release dependencies available for ARCHES=${ARCHES}"
+else
+  (
+    cd "${DIST_DIR}"
+    sha256sum syna-"${VERSION}"-linux-*.tar.gz > "syna-${VERSION}-checksums.txt"
+  )
 fi

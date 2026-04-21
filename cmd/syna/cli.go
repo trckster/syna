@@ -109,7 +109,11 @@ func disconnectCommand(paths commoncfg.ClientPaths, _ []string) error {
 	if err != nil {
 		return err
 	}
-	return agentrpc.Call(socket, "disconnect", nil, nil)
+	if err := agentrpc.Call(socket, "disconnect", nil, nil); err != nil {
+		return err
+	}
+	fmt.Println("Disconnected this device. Local files were left untouched.")
+	return nil
 }
 
 func keyCommand(paths commoncfg.ClientPaths, args []string) error {

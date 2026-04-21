@@ -65,32 +65,35 @@ For non-Coolify Docker deployments, see [`deploy/README.md`](./deploy/README.md)
 
 ### Client Installation On Linux
 
-Download the latest Syna release archive from
-[`github.com/trckster/syna/releases/latest`](https://github.com/trckster/syna/releases/latest).
-Choose the archive that matches the client CPU architecture:
-
-- `syna-<version>-linux-amd64.tar.gz` for typical x86_64 Linux machines
-- `syna-<version>-linux-arm64.tar.gz` for ARM64 Linux machines
-
-Install the client binary from the archive:
+Install the latest client release:
 
 ```bash
-tar -xzf syna-<version>-linux-amd64.tar.gz
-sudo install -m 0755 syna-<version>-linux-amd64/syna /usr/local/bin/syna
-syna version
+curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh | sh
 ```
 
-Use `linux-arm64` in the archive and extracted directory names on ARM64
-machines.
+The installer detects `linux-amd64` versus `linux-arm64`, resolves the latest
+GitHub Release, downloads the matching archive, verifies the checksum when the
+release publishes one, and installs only the client binary to
+`/usr/local/bin/syna`. If the per-user `syna.service` is already running, the
+installer restarts it after replacing the binary.
 
 The release archive also contains `syna-server`; client machines do not need
 that binary. Do not download GitHub's source-code archives for client
 installation; they do not contain built binaries. This repository does not build
 a `.deb` package.
 
-To upgrade a client, install the newer `syna` binary over the old one. If the
+To install a specific version or use a different destination:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh \
+  | SYNA_VERSION=v1.2.3 INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+`SYNA_VERSION` must match the GitHub Release tag.
+
+For manual upgrades, install the newer `syna` binary over the old one. If the
 daemon is already running under user systemd, restart it after replacing the
-binary:
+binary. The one-line installer handles this restart automatically.
 
 ```bash
 systemctl --user restart syna.service
@@ -187,6 +190,7 @@ them to GitHub Releases:
 ```text
 syna-<version>-linux-amd64.tar.gz
 syna-<version>-linux-arm64.tar.gz
+syna-<version>-checksums.txt
 ```
 
 Each archive contains:
