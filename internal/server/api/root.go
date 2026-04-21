@@ -26,7 +26,6 @@ var rootPageTemplate = template.Must(template.New("root").Parse(`<!doctype html>
 	--panel-strong: #171717;
 	--text: #f6f6f6;
 	--muted: #b9b9b9;
-	--quiet: #777;
 	--line: #2a2a2a;
 	--code: #ededed;
 }
@@ -61,11 +60,11 @@ main {
 	box-shadow: 0 24px 80px rgb(0 0 0 / 0.35);
 }
 .hero {
-	min-height: 560px;
+	min-height: auto;
 	padding: 36px;
 	display: flex;
 	flex-direction: column;
-	justify-content: space-between;
+	justify-content: flex-start;
 }
 .mark {
 	width: 52px;
@@ -224,12 +223,6 @@ h1 {
 .copy.copied {
 	color: var(--text);
 }
-.foot {
-	margin-top: 22px;
-	color: var(--quiet);
-	font-size: 13px;
-	line-height: 1.45;
-}
 @media (max-width: 820px) {
 	main {
 		width: min(100% - 24px, 620px);
@@ -279,7 +272,7 @@ h1 {
 				<div class="hero-copy">
 					<div>
 						<h1 id="title">Syna</h1>
-						<p class="lede">Private folder sync for your Linux devices. This server relays encrypted metadata and object blobs; your workspace key stays on your clients.</p>
+						<p class="lede">Private, encrypted sync for every Linux device you trust.</p>
 					</div>
 					<div class="transfer" aria-label="Server transfer statistics">
 						<strong>{{.TransferredText}}</strong>
@@ -334,7 +327,6 @@ h1 {
 					<p>Run <strong>syna connect</strong> on another Linux device and enter the recovery key from the first one.</p>
 				</div>
 			</div>
-			<p class="foot">Keep the server behind HTTPS with persistent storage mounted at /var/lib/syna.</p>
 		</section>
 	</div>
 </main>

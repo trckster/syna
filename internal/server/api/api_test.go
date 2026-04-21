@@ -44,7 +44,7 @@ func TestRootRendersWelcomePage(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"Syna",
-		"Private folder sync",
+		"Private, encrypted sync for every Linux device you trust.",
 		"curl -fsSL https://raw.githubusercontent.com/trckster/syna/master/scripts/install.sh | sh",
 		"syna connect https://syna.example.com",
 		`syna add "$HOME/Documents"`,
@@ -59,6 +59,11 @@ func TestRootRendersWelcomePage(t *testing.T) {
 	}
 	if strings.Contains(body, "/healthz") {
 		t.Fatal("body contains /healthz")
+	}
+	removedGuidance := strings.Join([]string{"Keep the server", "behind HTTPS"}, " ")
+	removedPath := strings.Join([]string{"/var", "lib", "syna"}, "/")
+	if strings.Contains(body, removedGuidance) || strings.Contains(body, removedPath) {
+		t.Fatal("body contains removed deployment guidance")
 	}
 }
 
