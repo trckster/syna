@@ -39,7 +39,7 @@ For non-Coolify Docker deployments, see [`deploy/README.md`](./deploy/README.md)
 Install the latest client release (Linux only):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/trckster/syna/master/scripts/install.sh | sh
 ```
 
 ## First Use
