@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type Config struct {
 	MaxSnapshotBody   int64
 	MaxSnapshotPlain  int64
 	MaxWSClients      int
+	MaxWorkspaces     int
 	ReadHeaderTimeout time.Duration
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
@@ -45,8 +47,12 @@ func Load() (Config, error) {
 		MaxSnapshotBody:   protocol.MaxSnapshotPlainSize,
 		MaxSnapshotPlain:  protocol.MaxSnapshotPlainSize,
 		MaxWSClients:      32,
+		MaxWorkspaces:     0,
 	}
 	var err error
+	if cfg.MaxWorkspaces, err = parseNonNegativeInt("SYNA_MAX_WORKSPACES", env("SYNA_MAX_WORKSPACES", "0")); err != nil {
+		return Config{}, err
+	}
 	if cfg.SessionTTL, err = time.ParseDuration(env("SYNA_SESSION_TTL", "24h")); err != nil {
 		return Config{}, fmt.Errorf("parse SYNA_SESSION_TTL: %w", err)
 	}
@@ -94,6 +100,17 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+func parseNonNegativeInt(key, value string) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", key, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", key)
+	}
+	return n, nil
+}
+
 func (cfg Config) Validate() error {
 	if cfg.MaxPlainChunkSize <= 0 {
 		return fmt.Errorf("MaxPlainChunkSize must be positive")
@@ -103,6 +120,9 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.MaxWSClients <= 0 {
 		return fmt.Errorf("MaxWSClients must be positive")
+	}
+	if cfg.MaxWorkspaces < 0 {
+		return fmt.Errorf("MaxWorkspaces must be non-negative")
 	}
 	if cfg.PublicBaseURL == "" {
 		return nil

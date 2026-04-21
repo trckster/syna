@@ -11,6 +11,7 @@ import (
 
 	commoncrypto "syna/internal/common/crypto"
 	"syna/internal/common/protocol"
+	"syna/internal/server/db"
 )
 
 const sessionNonceSize = 32
@@ -62,8 +63,12 @@ func (a *API) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "bad_workspace_pubkey", "workspace_pubkey is required when creating a workspace")
 				return
 			}
-			created, err = a.db.EnsureWorkspace(req.WorkspaceID, pubKey)
+			created, err = a.db.EnsureWorkspaceWithinLimit(req.WorkspaceID, pubKey, a.cfg.MaxWorkspaces)
 			if err != nil {
+				if errors.Is(err, db.ErrWorkspaceLimitReached) {
+					writeError(w, http.StatusForbidden, "workspace_limit_reached", err.Error())
+					return
+				}
 				writeError(w, http.StatusBadRequest, "workspace_create_failed", err.Error())
 				return
 			}

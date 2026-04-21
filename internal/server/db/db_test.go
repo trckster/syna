@@ -2,6 +2,7 @@ package db
 
 import (
 	"crypto/sha256"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -70,6 +71,33 @@ func TestTransferredBytesMetricAccumulates(t *testing.T) {
 	}
 	if got != 123 {
 		t.Fatalf("transferred bytes = %d want 123", got)
+	}
+}
+
+func TestEnsureWorkspaceWithinLimitRejectsNewWorkspaceAtLimit(t *testing.T) {
+	database := openTestDB(t)
+
+	created, err := database.EnsureWorkspaceWithinLimit("workspace-1", []byte("public-key-1"), 1)
+	if err != nil {
+		t.Fatalf("EnsureWorkspaceWithinLimit(first): %v", err)
+	}
+	if !created {
+		t.Fatalf("expected first workspace to be created")
+	}
+
+	created, err = database.EnsureWorkspaceWithinLimit("workspace-1", []byte("public-key-1"), 1)
+	if err != nil {
+		t.Fatalf("EnsureWorkspaceWithinLimit(existing): %v", err)
+	}
+	if created {
+		t.Fatalf("existing workspace should not be created again")
+	}
+
+	if _, err := database.EnsureWorkspaceWithinLimit("workspace-2", []byte("public-key-2"), 1); !errors.Is(err, ErrWorkspaceLimitReached) {
+		t.Fatalf("EnsureWorkspaceWithinLimit(over limit) error = %v want %v", err, ErrWorkspaceLimitReached)
+	}
+	if _, err := database.WorkspacePubKey("workspace-2"); err == nil {
+		t.Fatalf("workspace over the limit should not be inserted")
 	}
 }
 

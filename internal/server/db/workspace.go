@@ -8,7 +8,13 @@ import (
 	"time"
 )
 
+var ErrWorkspaceLimitReached = errors.New("workspace limit reached")
+
 func (db *DB) EnsureWorkspace(workspaceID string, pubKey []byte) (bool, error) {
+	return db.EnsureWorkspaceWithinLimit(workspaceID, pubKey, 0)
+}
+
+func (db *DB) EnsureWorkspaceWithinLimit(workspaceID string, pubKey []byte, maxWorkspaces int) (bool, error) {
 	now := time.Now().UTC()
 	tx, err := db.Begin(context.Background())
 	if err != nil {
@@ -22,6 +28,15 @@ func (db *DB) EnsureWorkspace(workspaceID string, pubKey []byte) (bool, error) {
 	case errors.Is(err, sql.ErrNoRows):
 		if len(pubKey) == 0 {
 			return false, sql.ErrNoRows
+		}
+		if maxWorkspaces > 0 {
+			var count int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&count); err != nil {
+				return false, err
+			}
+			if count >= maxWorkspaces {
+				return false, ErrWorkspaceLimitReached
+			}
 		}
 		if _, err := tx.Exec(`
 			INSERT INTO workspaces (workspace_id, auth_pubkey, current_seq, retained_floor_seq, created_at, updated_at)

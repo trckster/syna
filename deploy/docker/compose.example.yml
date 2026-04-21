@@ -12,6 +12,7 @@ services:
       SYNA_SESSION_TTL: "24h"
       SYNA_EVENT_RETENTION: "24h"
       SYNA_ZERO_REF_RETENTION: "168h"
+      SYNA_MAX_WORKSPACES: "0"
       SYNA_LOG_LEVEL: "info"
     ports:
       - "127.0.0.1:8080:8080"

@@ -39,6 +39,7 @@ Mounted data:
 | `SYNA_SESSION_TTL` | bearer token TTL, default `24h` |
 | `SYNA_EVENT_RETENTION` | event grace retention after snapshot compaction, default `24h` |
 | `SYNA_ZERO_REF_RETENTION` | zero-ref object retention, default `168h` |
+| `SYNA_MAX_WORKSPACES` | maximum number of workspace keys this server may create; `0` or unset means unlimited |
 | `SYNA_READ_HEADER_TIMEOUT` | HTTP header read timeout, default `10s` |
 | `SYNA_READ_TIMEOUT` | full request read timeout, default `30s` |
 | `SYNA_WRITE_TIMEOUT` | response write timeout, default `30s` |
@@ -89,6 +90,7 @@ services:
       SYNA_SESSION_TTL: "24h"
       SYNA_EVENT_RETENTION: "24h"
       SYNA_ZERO_REF_RETENTION: "168h"
+      SYNA_MAX_WORKSPACES: "0"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -118,6 +120,8 @@ Coolify configuration requirements:
 - environment variable: `SYNA_PUBLIC_BASE_URL=$COOLIFY_URL` with `Literal`
   disabled, so Coolify expands it from the configured domain before container
   start
+- optional environment variable: `SYNA_MAX_WORKSPACES=1` to allow only one
+  workspace key; unset or `0` keeps the default unlimited threshold
 - Ports Exposes: `8080`
 - Port Mappings: empty
 - Persistent Storage: Docker volume with name `syna-data`, empty source path,

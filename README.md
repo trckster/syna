@@ -23,11 +23,13 @@ In Coolify:
 4. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
 5. In Domains, set the HTTPS URL clients will use, for example
    `https://syna.example.com`.
-6. In Persistent Storage, add a Docker volume:
+6. In Environment Variables, add `SYNA_MAX_WORKSPACES=1` to allow only one
+   workspace key; leave it unset or set `0` for the default unlimited threshold.
+7. In Persistent Storage, add a Docker volume:
    - Name: `syna-data`
    - Source Path: leave empty
    - Destination Path: `/var/lib/syna`
-7. In Healthcheck, set port to `8080` and path to `/readyz`.
+8. In Healthcheck, set port to `8080` and path to `/readyz`.
 
 Do not use container-local ephemeral storage for `/var/lib/syna`; it contains
 the SQLite database and encrypted object store.

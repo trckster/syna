@@ -351,6 +351,69 @@ func TestSessionHandshakeAcceptsValidWorkspacePublicKey(t *testing.T) {
 	}
 }
 
+func TestSessionStartRejectsNewWorkspaceOverLimit(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+	api.cfg.MaxWorkspaces = 1
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	nonce := bytes.Repeat([]byte{0x66}, 32)
+
+	body, err := json.Marshal(protocol.SessionStartRequest{
+		WorkspaceID:     "workspace-over-limit",
+		DeviceID:        "device-1",
+		DeviceName:      "device",
+		ClientNonce:     base64Raw(nonce),
+		CreateIfMissing: true,
+		WorkspacePubKey: base64Raw(pub),
+	})
+	if err != nil {
+		t.Fatalf("Marshal(SessionStartRequest): %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/start", bytes.NewReader(body))
+	req.Header.Set(protocol.VersionHeader, "1")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d want %d body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "workspace_limit_reached") {
+		t.Fatalf("body does not contain workspace_limit_reached: %s", rec.Body.String())
+	}
+	if _, err := api.db.WorkspacePubKey("workspace-over-limit"); err == nil {
+		t.Fatalf("workspace over the limit should not be created")
+	}
+}
+
+func TestSessionStartAllowsExistingWorkspaceAtLimit(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+	api.cfg.MaxWorkspaces = 1
+	nonce := bytes.Repeat([]byte{0x77}, 32)
+
+	body, err := json.Marshal(protocol.SessionStartRequest{
+		WorkspaceID:     "workspace-1",
+		DeviceID:        "device-2",
+		DeviceName:      "second-device",
+		ClientNonce:     base64Raw(nonce),
+		CreateIfMissing: false,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(SessionStartRequest): %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/start", bytes.NewReader(body))
+	req.Header.Set(protocol.VersionHeader, "1")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
 func newAPITestHarness(t *testing.T) (*API, string) {
 	t.Helper()
 
