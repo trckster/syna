@@ -1,0 +1,38 @@
+blocked_nonempty means Syna refused to materialize the remote tracked root because the target path already exists and is not empty:
+
+  /root/test
+
+  This is a safety block to avoid overwriting local files during bootstrap.
+
+  To unblock it:
+
+  sudo ls -la /root/test
+
+  Then choose one:
+
+  1. If /root/test is disposable:
+
+  sudo rm -rf /root/test
+
+  2. If you want to keep its contents:
+
+  sudo mv /root/test /root/test.backup
+  sudo mkdir -p /root/test
+
+  Then wait up to 30 seconds, or restart the daemon. The client retries blocked roots automatically.
+
+  After that:
+
+  syna status
+
+  You want the root state to become active instead of blocked_nonempty.
+
+  One important detail: your target path is /root/test. If you expected this to sync into your normal user home, the daemon or CLI was likely run as root/with sudo. In that case, stop running Syna as root and reconnect/add the folder as your regular user,
+  otherwise it will keep resolving tracked paths under /root.
+
+
+
+>>> Should think more about pipeline for resolving blocked sync
+
+
+>>> Something strange happens when I try to add non-existing directory (it is being created and... ? check again)

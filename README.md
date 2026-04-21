@@ -5,6 +5,8 @@ you control. The server stores only encrypted sync metadata and object blobs; th
 workspace key stays on the clients, so the server can relay and retain data
 without being able to read file contents.
 
+![Preview](./docs/preview.png)
+
 ## Installation
 
 ### #1 Server Installation
