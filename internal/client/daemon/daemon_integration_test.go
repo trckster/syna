@@ -573,6 +573,88 @@ func TestIntegrationConcurrentEditConflictCopy(t *testing.T) {
 	}
 }
 
+func TestIntegrationRemoteOnlyCreateRaceDoesNotCreateConflictCopy(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := first.AddRoot(context.Background(), rootDir1); err != nil {
+		t.Fatalf("first AddRoot: %v", err)
+	}
+
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+	if err := second.bootstrap(context.Background()); err != nil {
+		t.Fatalf("second bootstrap: %v", err)
+	}
+
+	root, err := second.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel(second): %v", err)
+	}
+	file1 := filepath.Join(rootDir1, "file2")
+	if err := os.WriteFile(file1, []byte("from-vps\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(first): %v", err)
+	}
+	if err := first.rescanRootHint(context.Background(), root.RootID, "file2"); err != nil {
+		t.Fatalf("first rescanRootHint: %v", err)
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second bootstrapOrCatchUp: %v", err)
+	}
+
+	file2 := filepath.Join(home2, "notes", "file2")
+	if got, err := os.ReadFile(file2); err != nil {
+		t.Fatalf("ReadFile(second file2): %v", err)
+	} else if string(got) != "from-vps\n" {
+		t.Fatalf("unexpected second file2 contents %q", string(got))
+	}
+
+	if err := second.stateDB.DeleteEntry(root.RootID, "file2"); err != nil {
+		t.Fatalf("DeleteEntry(file2): %v", err)
+	}
+	if _, err := second.stateDB.SQL.Exec(`DELETE FROM ignore_events WHERE root_id = ? AND rel_path = ?`, root.RootID, "file2"); err != nil {
+		t.Fatalf("delete ignore event: %v", err)
+	}
+	if err := second.rescanRootHint(context.Background(), root.RootID, "file2"); err != nil {
+		t.Fatalf("second race rescanRootHint: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(home2, "notes", "file2.syna-conflict-*"))
+	if err != nil {
+		t.Fatalf("Glob(conflicts): %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no conflict copies for remote-only create, got %v", matches)
+	}
+	entries, err := second.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		t.Fatalf("EntriesForRoot(second): %v", err)
+	}
+	if _, ok := entries["file2"]; !ok {
+		t.Fatalf("expected file2 entry to be restored after applying remote head")
+	}
+}
+
 func TestIntegrationBootstrapIntoEmptyTarget(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()
