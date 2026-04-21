@@ -139,11 +139,15 @@ func addCommand(paths commoncfg.ClientPaths, args []string) error {
 		usage()
 		return exitCode(2)
 	}
+	path, err := resolvePathArg(args[0])
+	if err != nil {
+		return err
+	}
 	socket, err := ensureSocket(paths)
 	if err != nil {
 		return err
 	}
-	return agentrpc.Call(socket, "add", daemon.AddRequest{Path: args[0]}, nil)
+	return agentrpc.Call(socket, "add", daemon.AddRequest{Path: path}, nil)
 }
 
 func removeCommand(paths commoncfg.ClientPaths, args []string) error {
@@ -151,11 +155,33 @@ func removeCommand(paths commoncfg.ClientPaths, args []string) error {
 		usage()
 		return exitCode(2)
 	}
+	path, err := resolvePathArg(args[0])
+	if err != nil {
+		return err
+	}
 	socket, err := ensureSocket(paths)
 	if err != nil {
 		return err
 	}
-	return agentrpc.Call(socket, "rm", daemon.RemoveRequest{Path: args[0]}, nil)
+	return agentrpc.Call(socket, "rm", daemon.RemoveRequest{Path: path}, nil)
+}
+
+func resolvePathArg(input string) (string, error) {
+	if input == "~" || strings.HasPrefix(input, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if input == "~" {
+			input = home
+		} else {
+			input = filepath.Join(home, input[2:])
+		}
+	}
+	if filepath.IsAbs(input) {
+		return filepath.Clean(input), nil
+	}
+	return filepath.Abs(input)
 }
 
 func statusCommand(paths commoncfg.ClientPaths, _ []string) error {
