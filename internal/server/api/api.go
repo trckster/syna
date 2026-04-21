@@ -30,6 +30,7 @@ func New(cfg servercfg.Config, database *db.DB, store *objectstore.Store, eventH
 
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", a.handleRoot)
 	mux.HandleFunc("/healthz", a.handleHealthz)
 	mux.HandleFunc("/readyz", a.handleReadyz)
 	mux.HandleFunc("/v1/session/start", a.handleSessionStart)

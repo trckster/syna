@@ -22,6 +22,51 @@ import (
 	"syna/internal/server/objectstore"
 )
 
+func TestRootRendersWelcomePage(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+	api.cfg.PublicBaseURL = "https://syna.example.com/"
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Fatalf("Content-Type = %q want text/html", got)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Syna",
+		"Private folder sync",
+		"curl -fsSL https://raw.githubusercontent.com/trckster/syna/master/scripts/install.sh | sh",
+		"syna connect https://syna.example.com",
+		`syna add "$HOME/Documents"`,
+		`data-copy="syna connect https://syna.example.com"`,
+		"/readyz",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body does not contain %q", want)
+		}
+	}
+	if strings.Contains(body, "/healthz") {
+		t.Fatal("body contains /healthz")
+	}
+}
+
+func TestRootCatchAllReturnsNotFoundForUnknownPath(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/missing", nil)
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestObjectUploadRejectsInvalidHeaders(t *testing.T) {
 	api, token := newAPITestHarness(t)
 
