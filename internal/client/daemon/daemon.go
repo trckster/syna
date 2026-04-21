@@ -492,11 +492,14 @@ func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
 	if err != nil {
 		return err
 	}
-	root, err := d.stateDB.RootByHomeRel(homeRelPath)
+	roots, err := d.stateDB.ListRoots()
 	if err != nil {
 		return err
 	}
-	_ = absPath
+	root, err := rootForRemove(roots, absPath, homeRelPath)
+	if err != nil {
+		return err
+	}
 	if _, err := d.submitEvent(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
 		return err
 	}
@@ -505,6 +508,61 @@ func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
 		return err
 	}
 	return d.stateDB.DeleteRootState(root.RootID)
+}
+
+func rootForRemove(roots []state.Root, absPath, homeRelPath string) (*state.Root, error) {
+	cleanAbs := filepath.Clean(absPath)
+	for i := range roots {
+		root := &roots[i]
+		if cleanStoredRootPath(root.HomeRelPath) != cleanStoredRootPath(homeRelPath) && filepath.Clean(root.TargetAbsPath) != cleanAbs {
+			continue
+		}
+		if root.State == protocol.RootStateRemoved {
+			return nil, fmt.Errorf("path %q is already removed from sync", cleanAbs)
+		}
+		return root, nil
+	}
+	for i := range roots {
+		root := roots[i]
+		if root.State == protocol.RootStateRemoved || root.Kind != protocol.RootKindDir {
+			continue
+		}
+		if pathWithinRoot(root.TargetAbsPath, cleanAbs) {
+			return nil, fmt.Errorf("path %q is inside tracked root %q; syna rm only removes tracked roots", cleanAbs, filepath.Clean(root.TargetAbsPath))
+		}
+	}
+	active := activeRootTargets(roots)
+	if len(active) == 0 {
+		return nil, fmt.Errorf("path %q is not a tracked root", cleanAbs)
+	}
+	return nil, fmt.Errorf("path %q is not a tracked root; tracked roots: %s", cleanAbs, strings.Join(active, ", "))
+}
+
+func cleanStoredRootPath(path string) string {
+	return strings.Trim(filepath.ToSlash(filepath.Clean(path)), "/")
+}
+
+func pathWithinRoot(rootAbs, absPath string) bool {
+	root := filepath.Clean(rootAbs)
+	path := filepath.Clean(absPath)
+	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
+}
+
+func activeRootTargets(roots []state.Root) []string {
+	var targets []string
+	for _, root := range roots {
+		if root.State == protocol.RootStateRemoved {
+			continue
+		}
+		targets = append(targets, filepath.Clean(root.TargetAbsPath))
+	}
+	sort.Strings(targets)
+	const maxTargets = 5
+	if len(targets) > maxTargets {
+		remaining := len(targets) - maxTargets
+		targets = append(targets[:maxTargets], fmt.Sprintf("and %d more", remaining))
+	}
+	return targets
 }
 
 func (d *Daemon) Status() (*protocol.WorkspaceStatus, error) {
