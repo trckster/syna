@@ -17,17 +17,33 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(agentrpc.Response{OK: false, Error: err.Error()})
 		return
 	}
-	resp, err := d.dispatchRPC(req)
+	enc := json.NewEncoder(conn)
+	resp, err := d.dispatchRPC(req, func(progress AddProgress) {
+		if !req.Progress {
+			return
+		}
+		_ = enc.Encode(agentrpc.Response{OK: true, Progress: &agentrpc.Progress{
+			Stage:        progress.Stage,
+			Message:      progress.Message,
+			Path:         progress.Path,
+			DoneBytes:    progress.DoneBytes,
+			TotalBytes:   progress.TotalBytes,
+			DoneFiles:    progress.DoneFiles,
+			TotalFiles:   progress.TotalFiles,
+			DoneEntries:  progress.DoneEntries,
+			TotalEntries: progress.TotalEntries,
+		}})
+	})
 	out := agentrpc.Response{OK: err == nil}
 	if err != nil {
 		out.Error = err.Error()
 	} else {
 		out.Result = agentrpc.EncodeResult(resp)
 	}
-	_ = json.NewEncoder(conn).Encode(out)
+	_ = enc.Encode(out)
 }
 
-func (d *Daemon) dispatchRPC(req agentrpc.Request) (any, error) {
+func (d *Daemon) dispatchRPC(req agentrpc.Request, progress AddProgressFunc) (any, error) {
 	switch req.Method {
 	case "connect":
 		var args ConnectRequest
@@ -42,7 +58,7 @@ func (d *Daemon) dispatchRPC(req agentrpc.Request) (any, error) {
 		if err := json.Unmarshal(req.Params, &args); err != nil {
 			return nil, err
 		}
-		return nil, d.AddRoot(context.Background(), args.Path)
+		return nil, d.AddRootWithProgress(context.Background(), args.Path, progress)
 	case "rm":
 		var args RemoveRequest
 		if err := json.Unmarshal(req.Params, &args); err != nil {

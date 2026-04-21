@@ -17,7 +17,7 @@ type initialRootSync struct {
 	ObjectRefs []string
 }
 
-func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPath string, scan *scanner.Result) (*initialRootSync, error) {
+func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPath string, scan *scanner.Result, progress AddProgressFunc, progressState *addProgressState) (*initialRootSync, error) {
 	sync := &initialRootSync{
 		Snapshot: protocol.SnapshotPayload{
 			RootID:      rootID,
@@ -31,10 +31,22 @@ func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPa
 			if err := d.submitInitialDir(ctx, sync, rootID, pathID, item); err != nil {
 				return nil, err
 			}
+			progressState.DoneEntries++
+			reportAddProgress(progress, AddProgress{
+				Stage:        "syncing",
+				Message:      "synced directory",
+				Path:         displaySyncPath(homeRelPath, item.RelPath),
+				DoneBytes:    progressState.DoneBytes,
+				TotalBytes:   progressState.TotalBytes,
+				DoneFiles:    progressState.DoneFiles,
+				TotalFiles:   progressState.TotalFiles,
+				DoneEntries:  progressState.DoneEntries,
+				TotalEntries: progressState.TotalEntries,
+			})
 			continue
 		}
 		if item.Kind == protocol.RootKindFile {
-			if err := d.submitInitialFile(ctx, sync, rootID, pathID, item); err != nil {
+			if err := d.submitInitialFile(ctx, sync, rootID, pathID, item, homeRelPath, progress, progressState); err != nil {
 				return nil, err
 			}
 		}
@@ -69,8 +81,22 @@ func (d *Daemon) submitInitialDir(ctx context.Context, sync *initialRootSync, ro
 	return nil
 }
 
-func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, rootID, pathID string, item scanner.Entry) error {
-	up, err := uploader.UploadFile(ctx, d.conn, d.keys.BlobKey, d.cfg.WorkspaceID, rootID, pathID, item.RelPath, item.AbsPath, item.Mode, item.MTimeNS)
+func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, rootID, pathID string, item scanner.Entry, homeRelPath string, progress AddProgressFunc, progressState *addProgressState) error {
+	progressPath := displaySyncPath(homeRelPath, item.RelPath)
+	up, err := uploader.UploadFileWithProgress(ctx, d.conn, d.keys.BlobKey, d.cfg.WorkspaceID, rootID, pathID, item.RelPath, item.AbsPath, item.Mode, item.MTimeNS, func(upload uploader.Progress) {
+		progressState.DoneBytes += upload.PlainBytes
+		reportAddProgress(progress, AddProgress{
+			Stage:        "syncing",
+			Message:      "uploading file",
+			Path:         progressPath,
+			DoneBytes:    progressState.DoneBytes,
+			TotalBytes:   progressState.TotalBytes,
+			DoneFiles:    progressState.DoneFiles,
+			TotalFiles:   progressState.TotalFiles,
+			DoneEntries:  progressState.DoneEntries,
+			TotalEntries: progressState.TotalEntries,
+		})
+	})
 	if err != nil {
 		return err
 	}
@@ -78,6 +104,19 @@ func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, r
 	if err != nil {
 		return err
 	}
+	progressState.DoneFiles++
+	progressState.DoneEntries++
+	reportAddProgress(progress, AddProgress{
+		Stage:        "syncing",
+		Message:      "synced file",
+		Path:         progressPath,
+		DoneBytes:    progressState.DoneBytes,
+		TotalBytes:   progressState.TotalBytes,
+		DoneFiles:    progressState.DoneFiles,
+		TotalFiles:   progressState.TotalFiles,
+		DoneEntries:  progressState.DoneEntries,
+		TotalEntries: progressState.TotalEntries,
+	})
 	sync.Entries = append(sync.Entries, state.Entry{
 		RootID:        rootID,
 		RelPath:       item.RelPath,

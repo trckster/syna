@@ -147,7 +147,10 @@ func addCommand(paths commoncfg.ClientPaths, args []string) error {
 	if err != nil {
 		return err
 	}
-	return agentrpc.Call(socket, "add", daemon.AddRequest{Path: path}, nil)
+	progress := newAddProgressRenderer(os.Stderr)
+	err = agentrpc.CallWithProgress(socket, "add", daemon.AddRequest{Path: path}, nil, progress.Update)
+	progress.Done(err)
+	return err
 }
 
 func removeCommand(paths commoncfg.ClientPaths, args []string) error {

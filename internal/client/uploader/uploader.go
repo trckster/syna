@@ -19,7 +19,18 @@ type Result struct {
 	Refs    []string
 }
 
+type Progress struct {
+	PlainBytes int64
+	Chunks     int
+}
+
+type ProgressFunc func(Progress)
+
 func UploadFile(ctx context.Context, conn *connector.Client, blobKey []byte, workspaceID, rootID, pathID, relPath, absPath string, mode int64, mtimeNS int64) (*Result, error) {
+	return UploadFileWithProgress(ctx, conn, blobKey, workspaceID, rootID, pathID, relPath, absPath, mode, mtimeNS, nil)
+}
+
+func UploadFileWithProgress(ctx context.Context, conn *connector.Client, blobKey []byte, workspaceID, rootID, pathID, relPath, absPath string, mode int64, mtimeNS int64, progress ProgressFunc) (*Result, error) {
 	file, err := os.Open(absPath)
 	if err != nil {
 		return nil, err
@@ -58,6 +69,9 @@ func UploadFile(ctx context.Context, conn *connector.Client, blobKey []byte, wor
 		objectID := commoncrypto.ObjectID(blob)
 		if err := conn.UploadObject(ctx, objectID, "file_chunk", int64(len(buf)), blob); err != nil {
 			return nil, err
+		}
+		if progress != nil {
+			progress(Progress{PlainBytes: int64(len(buf)), Chunks: 1})
 		}
 		chunks = append(chunks, protocol.ChunkRef{ObjectID: objectID, PlainSize: int64(len(buf))})
 		refs = append(refs, objectID)

@@ -371,6 +371,10 @@ func (d *Daemon) Disconnect(ctx context.Context) error {
 }
 
 func (d *Daemon) AddRoot(ctx context.Context, input string) error {
+	return d.AddRootWithProgress(ctx, input, nil)
+}
+
+func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress AddProgressFunc) error {
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
 	d.mu.Lock()
@@ -400,10 +404,24 @@ func (d *Daemon) AddRoot(ctx context.Context, input string) error {
 		return errors.New("symlink roots are not supported")
 	}
 	rootID := commoncrypto.RootID(d.keys, homeRelPath)
+	reportAddProgress(progress, AddProgress{
+		Stage:   "scanning",
+		Message: "counting files",
+		Path:    homeRelPath,
+	})
 	scan, err := scanner.ScanRoot(absPath)
 	if err != nil {
 		return err
 	}
+	totals := addProgressTotals(scan)
+	reportAddProgress(progress, AddProgress{
+		Stage:        "syncing",
+		Message:      "starting upload",
+		Path:         homeRelPath,
+		TotalBytes:   totals.TotalBytes,
+		TotalFiles:   totals.TotalFiles,
+		TotalEntries: totals.TotalEntries,
+	})
 
 	root := state.Root{
 		RootID:        rootID,
@@ -428,15 +446,37 @@ func (d *Daemon) AddRoot(ctx context.Context, input string) error {
 		return err
 	}
 
-	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan)
+	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan, progress, totals)
 	if err != nil {
 		return err
 	}
 	if err := d.stateDB.ReplaceEntries(rootID, initialSync.Entries); err != nil {
 		return err
 	}
+	reportAddProgress(progress, AddProgress{
+		Stage:        "finalizing",
+		Message:      "publishing snapshot",
+		Path:         homeRelPath,
+		DoneBytes:    totals.DoneBytes,
+		TotalBytes:   totals.TotalBytes,
+		DoneFiles:    totals.DoneFiles,
+		TotalFiles:   totals.TotalFiles,
+		DoneEntries:  totals.DoneEntries,
+		TotalEntries: totals.TotalEntries,
+	})
 	d.publishInitialSnapshot(ctx, rootID, initialSync)
 	d.addWatcherRoot(rootID, absPath)
+	reportAddProgress(progress, AddProgress{
+		Stage:        "done",
+		Message:      "sync complete",
+		Path:         homeRelPath,
+		DoneBytes:    totals.TotalBytes,
+		TotalBytes:   totals.TotalBytes,
+		DoneFiles:    totals.TotalFiles,
+		TotalFiles:   totals.TotalFiles,
+		DoneEntries:  totals.TotalEntries,
+		TotalEntries: totals.TotalEntries,
+	})
 	return nil
 }
 
