@@ -36,15 +36,25 @@ func TestCLIHelpDoesNotNeedDaemon(t *testing.T) {
 		t.Fatalf("syna help: %v", err)
 	}
 	for _, want := range []string{
-		"syna connect <server-url>  connect",
-		"syna disconnect            disconnect",
-		"syna key show              print",
-		"syna add <path>            add",
-		"syna rm <path>             stop syncing",
-		"syna status                print",
+		"  syna connect <server-url>  connect",
+		"  syna disconnect            disconnect",
+		"  syna key show              print",
+		"  syna add <path>            add",
+		"  syna rm <path>             stop syncing",
+		"  syna status                print",
+		"  syna uninstall             remove",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("help output missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, hidden := range []string{
+		"syna -h",
+		"syna --help",
+		"syna --version",
+	} {
+		if strings.Contains(stdout, hidden) {
+			t.Fatalf("help output should not list alias %q:\n%s", hidden, stdout)
 		}
 	}
 	if _, err := os.Stat(clientPaths(home).SocketFile); !os.IsNotExist(err) {
@@ -167,7 +177,7 @@ func TestCLIKeyUsageRejectsUnsupportedForms(t *testing.T) {
 			t.Fatalf("expected syna %s to fail\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), stdout, stderr)
 		}
 		requireExitCode(t, err, 2)
-		if !strings.Contains(stdout, "syna key show              print the stored workspace recovery key") {
+		if !strings.Contains(stdout, "  syna key show              print the stored workspace recovery key") {
 			t.Fatalf("usage for syna %s missing key show\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), stdout, stderr)
 		}
 		if stderr != "" {
@@ -176,6 +186,52 @@ func TestCLIKeyUsageRejectsUnsupportedForms(t *testing.T) {
 	}
 	if _, err := os.Stat(clientPaths(home).SocketFile); !os.IsNotExist(err) {
 		t.Fatalf("unsupported key forms should not create or contact daemon socket, stat err=%v", err)
+	}
+}
+
+func TestCLIUninstallRemovesSynaDataButLeavesSyncedDirectories(t *testing.T) {
+	bin := buildSynaBinary(t)
+	server := newCLITestServer(t)
+	defer server.Close()
+
+	home := shortTempDir(t, "uninstall-home")
+	t.Cleanup(func() { stopDaemon(t, home) })
+
+	root := filepath.Join(home, "documents")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	note := filepath.Join(root, "note.txt")
+	if err := os.WriteFile(note, []byte("keep\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(note): %v", err)
+	}
+
+	stdout, stderr, err := runSyna(t, bin, home, "\n", "connect", server.URL)
+	if err != nil {
+		t.Fatalf("connect: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if stdout, stderr, err = runSyna(t, bin, home, "", "add", root); err != nil {
+		t.Fatalf("add: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	paths := clientPaths(home)
+	if _, err := os.Stat(paths.UnitFile); err != nil {
+		t.Fatalf("expected unit file before uninstall: %v", err)
+	}
+
+	stdout, stderr, err = runSyna(t, bin, home, "", "uninstall")
+	if err != nil {
+		t.Fatalf("uninstall: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Synced directories were left untouched.") {
+		t.Fatalf("uninstall output missing synced-directory confirmation:\n%s", stdout)
+	}
+	if _, err := os.Stat(note); err != nil {
+		t.Fatalf("uninstall should leave synced file untouched: %v", err)
+	}
+	for _, path := range []string{paths.ConfigDir, paths.StateDir, paths.UnitFile, bin} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed, stat err=%v", path, err)
+		}
 	}
 }
 

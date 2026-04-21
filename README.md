@@ -143,6 +143,7 @@ syna key show               Print the stored workspace recovery key
 syna add <path>             Start syncing a file or directory
 syna rm <path>              Stop syncing a path without deleting local files
 syna status                 Show sync and connection state
+syna uninstall              Remove Syna from this client
 syna version                Show client version
 syna help                   Show command help
 ```
@@ -161,6 +162,23 @@ systemctl --user status syna.service
 
 If user systemd is unavailable, the CLI falls back to launching `syna daemon`
 and writes logs to `$XDG_STATE_HOME/syna/daemon.log`.
+
+## Uninstall
+
+To remove Syna from a Linux client:
+
+```bash
+syna uninstall
+```
+
+This stops the recorded local daemon, disables and removes the per-user
+`syna.service` unit when present, removes `$XDG_CONFIG_HOME/syna` and
+`$XDG_STATE_HOME/syna`, deletes the stored recovery key and local client
+database, and removes the `syna` client binary that is running the command.
+Tracked folders and files are left on disk.
+
+If the binary was installed to a root-owned directory such as `/usr/local/bin`,
+the command may ask `sudo` to remove only that binary path.
 
 ## Server Operations
 

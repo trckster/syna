@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"syna/internal/buildinfo"
@@ -38,6 +40,7 @@ var commands = map[string]commandFunc{
 	"add":        addCommand,
 	"rm":         removeCommand,
 	"status":     statusCommand,
+	"uninstall":  uninstallCommand,
 }
 
 func run(paths commoncfg.ClientPaths, args []string) error {
@@ -170,20 +173,231 @@ func statusCommand(paths commoncfg.ClientPaths, _ []string) error {
 	return enc.Encode(status)
 }
 
+func uninstallCommand(paths commoncfg.ClientPaths, args []string) error {
+	if len(args) != 0 {
+		usage()
+		return exitCode(2)
+	}
+
+	var warnings []string
+	if warning, err := removeUserServiceIfPresent(paths); err != nil {
+		return err
+	} else if warning != "" {
+		warnings = append(warnings, warning)
+	}
+	if err := terminateRecordedDaemon(paths); err != nil {
+		return err
+	}
+	if err := removeClientData(paths); err != nil {
+		return err
+	}
+	removedBinary, err := removeCurrentBinary()
+	if err != nil {
+		return err
+	}
+
+	for _, warning := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+	}
+	fmt.Println("Removed Syna config, keyring, local state, daemon files, and user service.")
+	if removedBinary != "" {
+		fmt.Printf("Removed Syna binary: %s\n", removedBinary)
+	}
+	fmt.Println("Synced directories were left untouched.")
+	return nil
+}
+
 func usage() {
 	fmt.Println(`usage:
-syna connect <server-url>  connect this device to a workspace
-syna disconnect            disconnect this device and leave local files untouched
-syna key show              print the stored workspace recovery key
-syna add <path>            add a file or directory under $HOME to sync
-syna rm <path>             stop syncing a previously added path
-syna status                print workspace, connection, warning, and root status
-syna help                  show this help
-syna -h                    show this help
-syna --help                show this help
-syna version               print the client version
-syna --version             print the client version
-syna daemon                run the background daemon`)
+  syna connect <server-url>  connect this device to a workspace
+  syna disconnect            disconnect this device and leave local files untouched
+  syna key show              print the stored workspace recovery key
+  syna add <path>            add a file or directory under $HOME to sync
+  syna rm <path>             stop syncing a previously added path
+  syna status                print workspace, connection, warning, and root status
+  syna uninstall             remove Syna config, state, daemon, service, and binary
+  syna version               print the client version
+  syna daemon                run the background daemon
+  syna help                  show this help`)
+}
+
+func removeUserServiceIfPresent(paths commoncfg.ClientPaths) (string, error) {
+	unitExists := false
+	if _, err := os.Stat(paths.UnitFile); err == nil {
+		unitExists = true
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("could not inspect user service: %w", err)
+	}
+	if !unitExists {
+		return "", nil
+	}
+
+	var problems []string
+	if err := runCommand(exec.Command("systemctl", "--user", "disable", "--now", "syna.service")); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if err := os.Remove(paths.UnitFile); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("remove user service %s: %w", paths.UnitFile, err)
+	}
+	if err := runCommand(exec.Command("systemctl", "--user", "daemon-reload")); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if len(problems) > 0 {
+		return fmt.Sprintf("systemd cleanup was incomplete: %s", strings.Join(problems, "; ")), nil
+	}
+	return "", nil
+}
+
+func terminateRecordedDaemon(paths commoncfg.ClientPaths) error {
+	pidBytes, err := os.ReadFile(paths.PIDFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read daemon pid file: %w", err)
+	}
+	pidText := strings.TrimSpace(string(pidBytes))
+	if pidText == "" {
+		return nil
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("invalid daemon pid %q", pidText)
+	}
+	if pid == os.Getpid() {
+		return nil
+	}
+	if processGone(pid) {
+		return nil
+	}
+	isDaemon, err := isSynaDaemonProcess(pid)
+	if err != nil {
+		return err
+	}
+	if !isDaemon {
+		return fmt.Errorf("refusing to stop pid %d because it does not look like a Syna daemon", pid)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil && !isNoSuchProcess(err) {
+		return fmt.Errorf("stop daemon pid %d: %w", pid, err)
+	}
+	if waitForProcessExit(pid, 3*time.Second) {
+		return nil
+	}
+	if err := proc.Signal(syscall.SIGKILL); err != nil && !isNoSuchProcess(err) {
+		return fmt.Errorf("kill daemon pid %d: %w", pid, err)
+	}
+	if !waitForProcessExit(pid, 3*time.Second) {
+		return fmt.Errorf("daemon pid %d did not exit", pid)
+	}
+	return nil
+}
+
+func isSynaDaemonProcess(pid int) (bool, error) {
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("verify daemon pid %d: %w", pid, err)
+	}
+	fields := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(fields) < 2 {
+		return false, nil
+	}
+	hasDaemonArg := false
+	for _, field := range fields[1:] {
+		if field == "daemon" {
+			hasDaemonArg = true
+			break
+		}
+	}
+	if !hasDaemonArg {
+		return false, nil
+	}
+	return filepath.Base(fields[0]) == "syna", nil
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if processGone(pid) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return processGone(pid)
+}
+
+func processGone(pid int) bool {
+	return isNoSuchProcess(syscall.Kill(pid, 0))
+}
+
+func isNoSuchProcess(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ESRCH)
+}
+
+func removeClientData(paths commoncfg.ClientPaths) error {
+	for _, path := range []string{paths.ConfigDir, paths.StateDir} {
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func removeCurrentBinary() (string, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	execPath, err = filepath.Abs(execPath)
+	if err != nil {
+		return "", err
+	}
+
+	candidates := []string{execPath}
+	if lookedUp, err := exec.LookPath(os.Args[0]); err == nil {
+		if absLookedUp, err := filepath.Abs(lookedUp); err == nil && absLookedUp != execPath {
+			candidates = append(candidates, absLookedUp)
+		}
+	}
+
+	var removed []string
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if err := removeBinaryPath(candidate); err != nil {
+			return "", err
+		}
+		removed = append(removed, candidate)
+	}
+	return strings.Join(removed, ", "), nil
+}
+
+func removeBinaryPath(path string) error {
+	if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+		return nil
+	} else if !os.IsPermission(err) {
+		return fmt.Errorf("remove binary %s: %w", path, err)
+	}
+
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return fmt.Errorf("remove binary %s: permission denied; remove it with sudo", path)
+	}
+	if err := runCommand(exec.Command("sudo", "rm", "-f", "--", path)); err != nil {
+		return fmt.Errorf("remove binary %s with sudo: %w", path, err)
+	}
+	return nil
 }
 
 func ensureSocket(paths commoncfg.ClientPaths) (string, error) {
