@@ -97,8 +97,7 @@ func connectCommand(paths commoncfg.ClientPaths, args []string) error {
 	if resp.GeneratedRecoveryKey != "" {
 		fmt.Println(resp.GeneratedRecoveryKey)
 		fmt.Println("This recovery key lets other devices join the workspace.")
-		fmt.Println("Anyone with it can access the encrypted workspace; store it safely.")
-		fmt.Println("You can show it again on this connected device with: syna key show")
+		fmt.Println("Anyone with it can access the encrypted workspace; To retrieve an existing key: syna key show")
 	}
 	fmt.Printf("workspace: %s\n", resp.WorkspaceID)
 	for _, warning := range resp.Warnings {
@@ -417,30 +416,13 @@ func ensureSocket(paths commoncfg.ClientPaths) (string, error) {
 	if !cfg.DaemonAutoStart {
 		return "", errors.New("daemon socket is absent and auto-start is disabled; run `syna daemon` manually")
 	}
-	var startupErrors []string
-	if err := runCommand(exec.Command("systemctl", "--user", "start", "syna.service")); err == nil {
-		if err := waitForSocket(paths.SocketFile, 3*time.Second); err == nil {
-			return paths.SocketFile, nil
-		} else {
-			startupErrors = append(startupErrors, "systemd start succeeded but daemon did not answer: "+err.Error())
-		}
-	} else {
-		startupErrors = append(startupErrors, err.Error())
-	}
 
-	_ = os.Remove(paths.SocketFile)
-	fallback := exec.Command(os.Args[0], "daemon")
-	if logFile, err := os.OpenFile(filepath.Join(paths.StateDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
-		fallback.Stdout = logFile
-		fallback.Stderr = logFile
+	if err := daemon.StartUserService(paths); err != nil {
+		return "", fmt.Errorf("cannot start Syna daemon with user systemd: %w", err)
 	}
-	if err := fallback.Start(); err != nil {
-		startupErrors = append(startupErrors, "fallback daemon launch failed: "+err.Error())
-		return "", fmt.Errorf("daemon auto-start failed: %s", strings.Join(startupErrors, "; "))
-	}
-	if err := waitForSocket(paths.SocketFile, 5*time.Second); err != nil {
-		startupErrors = append(startupErrors, fmt.Sprintf("fallback daemon pid %d did not answer: %v", fallback.Process.Pid, err))
-		return "", fmt.Errorf("daemon auto-start failed: %s", strings.Join(startupErrors, "; "))
+	if err := waitForSocket(paths.SocketFile, 3*time.Second); err != nil {
+		_ = os.Remove(paths.SocketFile)
+		return "", fmt.Errorf("cannot start Syna daemon with user systemd: service started but daemon did not answer: %w", err)
 	}
 	return paths.SocketFile, nil
 }

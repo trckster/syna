@@ -39,10 +39,12 @@ The supported v1 lifecycle is:
 
 - a `systemd --user` unit named `syna.service`
 - `ExecStart` runs `syna daemon`
-- the first successful `syna connect <server-url>` must install or refresh that unit in `~/.config/systemd/user/`
-- if `daemon_auto_start=true`, that first successful connect must run `systemctl --user daemon-reload` and `systemctl --user enable --now syna.service`
+- when `daemon_auto_start=true`, the CLI must install or refresh that unit in `~/.config/systemd/user/` before starting the daemon
+- when starting the daemon, the CLI must run `systemctl --user daemon-reload` and `systemctl --user start syna.service`
+- after a successful `syna connect <server-url>`, the daemon must run `systemctl --user enable --now syna.service`
 - later CLI invocations must connect to `~/.local/state/syna/agent.sock`
-- if the socket is absent and `daemon_auto_start=true`, the CLI must run `systemctl --user start syna.service` and wait for the socket to appear
+- if the socket is absent and `daemon_auto_start=true`, the CLI must use user systemd to start `syna.service` and wait for the socket to appear
+- if user systemd is unavailable while `daemon_auto_start=true`, the CLI must fail with a clear fatal message and must not launch `syna daemon` directly
 - if `daemon_auto_start=false`, the CLI must not enable the service automatically and should instead tell the user to start `syna daemon` or `systemctl --user start syna.service`
 
 In the default Linux setup, "starts after reboot" means "starts for that user on the next login". Machines that must keep syncing before login may use `loginctl enable-linger <user>`, but that is an explicit operator choice rather than a client default.

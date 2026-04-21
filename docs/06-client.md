@@ -12,6 +12,7 @@ It supports two modes:
 There is no separate third client-daemon binary. `syna daemon` is the long-lived daemon mode of the `syna` binary.
 
 When `daemon_auto_start=true`, the daemon is managed by a `systemd --user` service and the CLI starts that service when the Unix socket is absent.
+If user systemd is unavailable, automatic startup fails instead of launching a private `syna daemon` process.
 
 ## Daemon Lifecycle On Linux
 
@@ -20,10 +21,12 @@ Syna v1 uses a per-user `systemd --user` unit named `syna.service`.
 Rules:
 
 - `ExecStart` must run `syna daemon`
-- the first successful `syna connect <server-url>` must install or refresh `~/.config/systemd/user/syna.service`
-- if `daemon_auto_start=true`, that first successful connect must run `systemctl --user daemon-reload` and `systemctl --user enable --now syna.service`
+- if `daemon_auto_start=true`, the CLI must install or refresh `~/.config/systemd/user/syna.service` before starting the daemon
+- when starting the daemon, the CLI must run `systemctl --user daemon-reload` and `systemctl --user start syna.service`
+- after a successful `syna connect <server-url>`, the daemon must run `systemctl --user enable --now syna.service`
 - later CLI invocations must first try `~/.local/state/syna/agent.sock`
-- if the socket is absent and `daemon_auto_start=true`, the CLI must run `systemctl --user start syna.service` and wait briefly for the socket
+- if the socket is absent and `daemon_auto_start=true`, the CLI must use user systemd to start `syna.service` and wait briefly for the socket
+- if user systemd is unavailable while `daemon_auto_start=true`, the CLI must fail clearly and must not launch `syna daemon` directly
 - if the socket is absent and `daemon_auto_start=false`, the CLI must fail with a clear message telling the user to start `syna daemon` or the user service manually
 
 Default reboot behavior is "restart for that user at next login". Systems that require sync before login may enable `loginctl enable-linger <user>` separately.

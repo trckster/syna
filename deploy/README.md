@@ -57,9 +57,15 @@ No Coolify command override is required; the Dockerfile already runs
 `syna-server serve`. Leave custom Docker options empty. No separate WebSocket
 toggle is required when using Coolify's normal domain/proxy path.
 
-Required environment variables:
+Required environment variables in Coolify:
 
-- `SYNA_PUBLIC_BASE_URL=https://syna.example.com`
+- `SYNA_PUBLIC_BASE_URL=$COOLIFY_URL`
+
+Coolify's `Domains` field is the source of truth for the public URL. Keep the
+environment variable's `Literal` option disabled so Coolify expands
+`$COOLIFY_URL` before starting the container. If the resource has multiple
+domains, set `SYNA_PUBLIC_BASE_URL` to the single canonical HTTPS URL clients
+should use instead.
 
 The image and application already default to:
 

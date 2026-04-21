@@ -111,10 +111,13 @@ install_binary() {
   die "cannot write to ${INSTALL_DIR}; rerun with sudo or set INSTALL_DIR to a writable directory"
 }
 
-restart_user_service_if_running() {
-  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet syna.service 2>/dev/null; then
+restart_user_service_if_present() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user cat syna.service >/dev/null 2>&1; then
+    if ! systemctl --user daemon-reload; then
+      warn "installed new binary, but could not reload user systemd"
+    fi
     if systemctl --user restart syna.service; then
-      log "restarted running syna user service"
+      log "restarted syna user service"
     else
       warn "installed new binary, but could not restart syna user service"
     fi
@@ -169,7 +172,7 @@ main() {
   fi
 
   install_binary "${binary}"
-  restart_user_service_if_running
+  restart_user_service_if_present
 
   log "installed ${INSTALL_DIR}/syna"
   "${INSTALL_DIR}/syna" version

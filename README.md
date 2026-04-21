@@ -5,23 +5,9 @@ you control. The server stores only encrypted sync metadata and object blobs; th
 workspace key stays on the clients, so the server can relay and retain data
 without being able to read file contents.
 
-> Syna is an early v1 implementation for Linux clients and single-server
-> deployments.
-
-## Deployment Model
-
-Syna is distributed to clients through GitHub Releases. Client machines should
-download the latest release archive for their CPU architecture and install the
-`syna` binary from it; they should not clone this repository or build anything.
-
-The server is deployed from this repository. Coolify can build the server
-container directly from the repo, or operators can build the Docker image from
-`deploy/docker/Dockerfile.server`. Syna does not currently publish Debian
-packages or a public server container image.
-
 ## Installation
 
-### Server Installation With Coolify
+### #1 Server Installation
 
 Deploy one Syna server and give it persistent storage. The server should be
 reachable over HTTPS at the same public URL your clients will use, for example
@@ -33,74 +19,28 @@ In Coolify:
    Repository` for a public repo, or the appropriate GitHub App / Deploy Key
    option for a private repo.
 2. After Coolify checks the repository, set the build pack to `Dockerfile`.
-3. Set the base directory to `/`.
-4. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
-5. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
-6. In Domains, set the HTTPS URL clients will use, for example
+3. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
+4. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
+5. In Domains, set the HTTPS URL clients will use, for example
    `https://syna.example.com`.
-7. In Persistent Storage, add a Docker volume:
+6. In Persistent Storage, add a Docker volume:
    - Name: `syna-data`
    - Source Path: leave empty
    - Destination Path: `/var/lib/syna`
-8. In Healthcheck, set port to `8080` and path to `/readyz`.
+7. In Healthcheck, set port to `8080` and path to `/readyz`.
 
-The Dockerfile already starts the server with `syna-server serve`; no Coolify
-start command override or custom Docker option is required. Coolify's normal
-domain/proxy path is sufficient for Syna's WebSocket endpoint; no separate
-WebSocket toggle is required.
-
-Syna has defaults for its server runtime settings, including listen address,
-data directory, session TTLs, retention windows, and HTTP timeouts. For a
-production deployment, set only the public URL clients should use:
-
-```text
-SYNA_PUBLIC_BASE_URL=https://syna.example.com
-```
-
-This value must match the HTTPS URL configured in Coolify's `Domains` field.
 Do not use container-local ephemeral storage for `/var/lib/syna`; it contains
 the SQLite database and encrypted object store.
 
 For non-Coolify Docker deployments, see [`deploy/README.md`](./deploy/README.md).
 
-### Client Installation On Linux
+### #2 Client Installation
 
-Install the latest client release:
+Install the latest client release (Linux only):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh | sh
 ```
-
-The installer detects `linux-amd64` versus `linux-arm64`, resolves the latest
-GitHub Release, downloads the matching archive, verifies the checksum when the
-release publishes one, and installs only the client binary to
-`/usr/local/bin/syna`. If the per-user `syna.service` is already running, the
-installer restarts it after replacing the binary.
-
-The release archive also contains `syna-server`; client machines do not need
-that binary. Do not download GitHub's source-code archives for client
-installation; they do not contain built binaries. This repository does not build
-a `.deb` package.
-
-To install a specific version or use a different destination:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh \
-  | SYNA_VERSION=v1.2.3 INSTALL_DIR="$HOME/.local/bin" sh
-```
-
-`SYNA_VERSION` must match the GitHub Release tag.
-
-For manual upgrades, install the newer `syna` binary over the old one. If the
-daemon is already running under user systemd, restart it after replacing the
-binary. The one-line installer handles this restart automatically.
-
-```bash
-systemctl --user restart syna.service
-```
-
-If user systemd is unavailable, stop any manually launched `syna daemon` process
-and let the next CLI command start it again.
 
 ## First Use
 
@@ -108,16 +48,6 @@ Connect the first Linux device to your server:
 
 ```bash
 syna connect https://syna.example.com
-```
-
-At the recovery-key prompt, press Enter to create a new workspace on a fresh
-server. Syna prints a `syna1-...` recovery key. This key lets other devices
-join the same encrypted workspace, and anyone who has it can access that
-workspace, so store it somewhere safe. On a connected device, show the locally
-stored key again with:
-
-```bash
-syna key show
 ```
 
 Start syncing a folder:
@@ -160,9 +90,6 @@ On systems with user systemd, the daemon is managed as:
 systemctl --user status syna.service
 ```
 
-If user systemd is unavailable, the CLI falls back to launching `syna daemon`
-and writes logs to `$XDG_STATE_HOME/syna/daemon.log`.
-
 ## Uninstall
 
 To remove Syna from a Linux client:
@@ -170,15 +97,6 @@ To remove Syna from a Linux client:
 ```bash
 syna uninstall
 ```
-
-This stops the recorded local daemon, disables and removes the per-user
-`syna.service` unit when present, removes `$XDG_CONFIG_HOME/syna` and
-`$XDG_STATE_HOME/syna`, deletes the stored recovery key and local client
-database, and removes the `syna` client binary that is running the command.
-Tracked folders and files are left on disk.
-
-If the binary was installed to a root-owned directory such as `/usr/local/bin`,
-the command may ask `sudo` to remove only that binary path.
 
 ## Server Operations
 
@@ -199,30 +117,6 @@ syna-server version
 
 See [`deploy/README.md`](./deploy/README.md) for Docker Compose, Coolify,
 reverse-proxy, backup, restore, and upgrade guidance.
-
-## Release Artifacts
-
-Maintainers build Linux release archives with `./scripts/release.sh` and upload
-them to GitHub Releases:
-
-```text
-syna-<version>-linux-amd64.tar.gz
-syna-<version>-linux-arm64.tar.gz
-syna-<version>-checksums.txt
-```
-
-Each archive contains:
-
-```text
-syna
-syna-server
-README.md
-```
-
-Client machines only need the `syna` binary from the published release archive.
-Servers deployed through Coolify use the Dockerfile at
-`deploy/docker/Dockerfile.server`. The release script does not produce Debian
-packages.
 
 ## Development
 
@@ -261,11 +155,3 @@ Build release archives:
 - Symlinks and special files are skipped and surfaced as warnings.
 - Renames sync as delete plus put.
 - Local HTTP requires `SYNA_ALLOW_HTTP=true` and is only for development.
-
-## Documentation
-
-- [`docs/00-index.md`](./docs/00-index.md): documentation index
-- [`docs/02-architecture.md`](./docs/02-architecture.md): architecture overview
-- [`docs/03-crypto-and-trust.md`](./docs/03-crypto-and-trust.md): crypto and trust model
-- [`docs/08-deployment-and-operations.md`](./docs/08-deployment-and-operations.md): operations reference
-- [`docs/10-release-checklist.md`](./docs/10-release-checklist.md): release checklist

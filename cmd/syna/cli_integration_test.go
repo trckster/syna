@@ -77,11 +77,11 @@ func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	if recoveryKey(stdout) == "" {
 		t.Fatalf("connect output did not include generated recovery key:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "You can show it again on this connected device with: syna key show") {
+	if !strings.Contains(stdout, "To retrieve an existing key: syna key show") {
 		t.Fatalf("connect output did not mention syna key show:\n%s", stdout)
 	}
 	paths := clientPaths(home)
-	for _, path := range []string{paths.ConfigFile, paths.KeyringFile, paths.DBFile, paths.SocketFile, paths.PIDFile} {
+	for _, path := range []string{paths.ConfigFile, paths.KeyringFile, paths.DBFile, paths.SocketFile, paths.PIDFile, paths.UnitFile} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected %s to exist after connect: %v", path, err)
 		}
@@ -96,6 +96,27 @@ func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	}
 	if status.WorkspaceID == "" || status.ServerURL != server.URL {
 		t.Fatalf("unexpected status after connect: %+v", status)
+	}
+}
+
+func TestCLIAutoStartRequiresUserSystemd(t *testing.T) {
+	bin := buildSynaBinary(t)
+	home := shortTempDir(t, "no-systemd")
+	env := clientEnvWithSystemctl(t, home, "#!/bin/sh\necho systemctl unavailable >&2\nexit 1\n")
+
+	stdout, stderr, err := runSynaWithEnv(t, bin, home, env, "", "status")
+	if err == nil {
+		t.Fatalf("expected status to fail when user systemd is unavailable\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "cannot start Syna daemon with user systemd") {
+		t.Fatalf("missing user-systemd fatal message\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "systemctl unavailable") {
+		t.Fatalf("missing systemctl failure detail\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	paths := clientPaths(home)
+	if _, err := os.Stat(paths.PIDFile); !os.IsNotExist(err) {
+		t.Fatalf("auto-start failure should not launch a direct daemon, pid stat err=%v", err)
 	}
 }
 
@@ -123,7 +144,7 @@ func TestCLIKeyShowReadsLocalKeyring(t *testing.T) {
 	if key == "" {
 		t.Fatalf("missing recovery key in output:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "Anyone with it can access the encrypted workspace; store it safely.") {
+	if !strings.Contains(stdout, "Anyone with it can access the encrypted workspace") {
 		t.Fatalf("connect output missing recovery key warning:\n%s", stdout)
 	}
 
@@ -566,11 +587,16 @@ func (s *cliRestartableServer) Close() {
 
 func runSyna(t *testing.T, bin, home, stdin string, args ...string) (string, string, error) {
 	t.Helper()
+	return runSynaWithEnv(t, bin, home, clientEnv(t, home), stdin, args...)
+}
+
+func runSynaWithEnv(t *testing.T, bin, home string, env []string, stdin string, args ...string) (string, string, error) {
+	t.Helper()
 	if err := os.MkdirAll(home, 0o755); err != nil {
 		t.Fatalf("MkdirAll(home): %v", err)
 	}
 	cmd := exec.Command(bin, args...)
-	cmd.Env = clientEnv(t, home)
+	cmd.Env = env
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -594,12 +620,17 @@ func requireExitCode(t *testing.T, err error, want int) {
 
 func clientEnv(t *testing.T, home string) []string {
 	t.Helper()
+	return clientEnvWithSystemctl(t, home, fakeSystemctlScript())
+}
+
+func clientEnvWithSystemctl(t *testing.T, home, script string) []string {
+	t.Helper()
 	fakeBin := filepath.Join(t.TempDir(), "fake-bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatalf("MkdirAll(fake-bin): %v", err)
 	}
 	systemctl := filepath.Join(fakeBin, "systemctl")
-	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	if err := os.WriteFile(systemctl, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(systemctl): %v", err)
 	}
 	env := filteredEnv("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "SYNA_ALLOW_HTTP", "PATH")
@@ -611,6 +642,93 @@ func clientEnv(t *testing.T, home string) []string {
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
 	return env
+}
+
+func fakeSystemctlScript() string {
+	return `#!/bin/sh
+set -eu
+
+if [ "$#" -lt 2 ] || [ "$1" != "--user" ]; then
+  echo "unsupported systemctl invocation: $*" >&2
+  exit 1
+fi
+shift
+
+config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
+unit="${config_home}/systemd/user/syna.service"
+pid_file="${state_home}/syna/daemon.pid"
+log_file="${state_home}/syna/daemon.log"
+
+start_service() {
+  if [ ! -f "$unit" ]; then
+    echo "Unit syna.service not found" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$log_file")"
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  exec_start="$(sed -n 's/^ExecStart=//p' "$unit" | head -n 1)"
+  if [ -z "$exec_start" ]; then
+    echo "syna.service has no ExecStart" >&2
+    exit 1
+  fi
+  set -- $exec_start
+  "$@" >> "$log_file" 2>&1 &
+}
+
+stop_service() {
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  fi
+}
+
+case "$1" in
+  daemon-reload)
+    exit 0
+    ;;
+  enable)
+    if [ "$#" -eq 3 ] && [ "$2" = "--now" ] && [ "$3" = "syna.service" ]; then
+      start_service
+      exit 0
+    fi
+    ;;
+  start)
+    if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
+      start_service
+      exit 0
+    fi
+    ;;
+  restart)
+    if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
+      stop_service
+      start_service
+      exit 0
+    fi
+    ;;
+  disable)
+    if [ "$#" -eq 3 ] && [ "$2" = "--now" ] && [ "$3" = "syna.service" ]; then
+      exit 0
+    fi
+    ;;
+  cat)
+    if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
+      cat "$unit"
+      exit 0
+    fi
+    ;;
+esac
+
+echo "unsupported systemctl invocation: --user $*" >&2
+exit 1
+`
 }
 
 func filteredEnv(keys ...string) []string {

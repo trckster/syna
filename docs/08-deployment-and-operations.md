@@ -115,6 +115,9 @@ Coolify configuration requirements:
 - base directory: `/`
 - Dockerfile location: `/deploy/docker/Dockerfile.server`
 - Domains: the HTTPS URL clients use
+- environment variable: `SYNA_PUBLIC_BASE_URL=$COOLIFY_URL` with `Literal`
+  disabled, so Coolify expands it from the configured domain before container
+  start
 - Ports Exposes: `8080`
 - Port Mappings: empty
 - Persistent Storage: Docker volume with name `syna-data`, empty source path,
@@ -124,6 +127,9 @@ Coolify configuration requirements:
 
 No custom Docker options or separate WebSocket toggle are required when using
 Coolify's normal domain/proxy path.
+
+If the Coolify resource has multiple domains, set `SYNA_PUBLIC_BASE_URL` to the
+single canonical HTTPS URL clients should use instead of `$COOLIFY_URL`.
 
 Do not store SQLite or object data in container-local ephemeral storage.
 If using a bind mount instead of a Docker volume, mount a host directory such
