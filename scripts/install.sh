@@ -53,47 +53,6 @@ download() {
   curl -fsSL --retry 3 --retry-delay 1 -o "${output}" "${url}"
 }
 
-download_optional_checksum() {
-  url="$1"
-  output="$2"
-
-  if ! http_status="$(curl -sSL --retry 3 --retry-delay 1 -w '%{http_code}' -o "${output}" "${url}")"; then
-    rm -f "${output}"
-    return 2
-  fi
-
-  case "${http_status}" in
-    200)
-      return 0
-      ;;
-    404)
-      rm -f "${output}"
-      return 1
-      ;;
-    *)
-      rm -f "${output}"
-      return 2
-      ;;
-  esac
-}
-
-verify_checksum() {
-  archive="$1"
-  checksums="$2"
-
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    warn "sha256sum is unavailable; skipping archive checksum verification"
-    return 0
-  fi
-
-  line="$(grep "  ${archive}\$" "${checksums}" || true)"
-  if [ -z "${line}" ]; then
-    die "checksum file does not contain ${archive}"
-  fi
-
-  printf '%s\n' "${line}" | (cd "$(dirname "${checksums}")" && sha256sum -c - >/dev/null)
-}
-
 install_binary() {
   binary="$1"
   target="${INSTALL_DIR}/syna"
@@ -130,7 +89,6 @@ main() {
   fi
 
   need_cmd curl
-  need_cmd grep
   need_cmd install
   need_cmd mktemp
   need_cmd tar
@@ -144,26 +102,12 @@ main() {
 
   archive="syna-${version}-linux-${arch}.tar.gz"
   package_dir="syna-${version}-linux-${arch}"
-  checksums="syna-${version}-checksums.txt"
   base_url="https://github.com/${REPO}/releases/download/${version}"
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
 
   log "installing Syna ${version} for linux-${arch}"
   download "${base_url}/${archive}" "${tmp_dir}/${archive}"
-
-  if download_optional_checksum "${base_url}/${checksums}" "${tmp_dir}/${checksums}"; then
-    verify_checksum "${archive}" "${tmp_dir}/${checksums}"
-  else
-    case "$?" in
-      1)
-        warn "checksum file is not published for ${version}; installing without checksum verification"
-        ;;
-      *)
-        die "could not download checksum file for ${version}; aborting because archive cannot be verified"
-        ;;
-    esac
-  fi
 
   tar -xzf "${tmp_dir}/${archive}" -C "${tmp_dir}"
   binary="${tmp_dir}/${package_dir}/syna"
