@@ -87,7 +87,7 @@ func connectCommand(paths commoncfg.ClientPaths, args []string) error {
 	}
 	req := daemon.ConnectRequest{ServerURL: args[0]}
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Recovery key (leave blank to create a new workspace on a fresh server): ")
+	fmt.Print("Recovery key (leave blank to create a new workspace): ")
 	line, _ := reader.ReadString('\n')
 	req.RecoveryKey = strings.TrimSpace(line)
 	var resp daemon.ConnectResponse
@@ -95,11 +95,13 @@ func connectCommand(paths commoncfg.ClientPaths, args []string) error {
 		return err
 	}
 	if resp.GeneratedRecoveryKey != "" {
-		fmt.Println(resp.GeneratedRecoveryKey)
-		fmt.Println("This recovery key lets other devices join the workspace.")
-		fmt.Println("Anyone with it can access the encrypted workspace; To retrieve an existing key: syna key show")
+		fmt.Println()
+		fmt.Printf("Your secret key: %s\n", resp.GeneratedRecoveryKey)
+		fmt.Println()
+		fmt.Println("Use it to connect other devices and don't share it with anyone!")
+	} else {
+		fmt.Println("Connection established!")
 	}
-	fmt.Printf("workspace: %s\n", resp.WorkspaceID)
 	for _, warning := range resp.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
 	}

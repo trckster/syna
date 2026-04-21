@@ -74,11 +74,21 @@ func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("syna connect failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	if recoveryKey(stdout) == "" {
+	key := recoveryKey(stdout)
+	if key == "" {
 		t.Fatalf("connect output did not include generated recovery key:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "To retrieve an existing key: syna key show") {
-		t.Fatalf("connect output did not mention syna key show:\n%s", stdout)
+	if !strings.Contains(stdout, "Recovery key (leave blank to create a new workspace): ") {
+		t.Fatalf("connect output missing recovery key prompt:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Your secret key: "+key) {
+		t.Fatalf("connect output did not label generated secret key:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Use it to connect other devices and don't share it with anyone!") {
+		t.Fatalf("connect output missing secret key warning:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "To retrieve an existing key: syna key show") {
+		t.Fatalf("connect output should not include old key-show guidance:\n%s", stdout)
 	}
 	paths := clientPaths(home)
 	for _, path := range []string{paths.ConfigFile, paths.KeyringFile, paths.DBFile, paths.SocketFile, paths.PIDFile, paths.UnitFile} {
@@ -144,7 +154,7 @@ func TestCLIKeyShowReadsLocalKeyring(t *testing.T) {
 	if key == "" {
 		t.Fatalf("missing recovery key in output:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "Anyone with it can access the encrypted workspace") {
+	if !strings.Contains(stdout, "Use it to connect other devices and don't share it with anyone!") {
 		t.Fatalf("connect output missing recovery key warning:\n%s", stdout)
 	}
 
@@ -292,6 +302,12 @@ func TestCLIRealDaemonsSyncCreateEditAndDelete(t *testing.T) {
 
 	if stdout, stderr, err = runSyna(t, bin, homeB, key+"\n", "connect", server.URL); err != nil {
 		t.Fatalf("connect B: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Connection established!") {
+		t.Fatalf("connect B output missing connection confirmation:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "workspace:") {
+		t.Fatalf("connect B output should not expose workspace ID:\n%s", stdout)
 	}
 	rootB := filepath.Join(homeB, "notes")
 	waitForFileContent(t, filepath.Join(rootB, "deep", "note.txt"), "initial\n", 10*time.Second)

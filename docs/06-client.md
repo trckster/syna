@@ -116,9 +116,9 @@ The command stores:
 - workspace key in `keyring.json`
 - session state in the local DB
 
-If this is the first client for that server, print the generated recovery key to stdout and explain that the key lets other devices join the workspace, anyone with it can access the encrypted workspace, and it should be stored safely. The generated `syna1-...` key remains on its own line so scripts can parse it.
+If this is the first client for that server, print the generated recovery key to stdout as `Your secret key: syna1-...`, then explain that the key lets other devices join and should not be shared.
 
-The output must also tell the user they can show the locally stored key again on the connected device with `syna key show`.
+If the user provides an existing recovery key, print `Connection established!` after the connection succeeds.
 
 If the installation is already connected to a different server, the command must fail with a clear message telling the user to run `syna disconnect` first.
 
