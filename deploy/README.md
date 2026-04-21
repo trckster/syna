@@ -1,13 +1,34 @@
 # Deployment
 
-This repository ships a server container build in [`deploy/docker/Dockerfile.server`](./docker/Dockerfile.server) and a local reference stack in [`deploy/docker/compose.example.yml`](./docker/compose.example.yml).
+This repository ships the server container build definition in
+[`deploy/docker/Dockerfile.server`](./docker/Dockerfile.server) and a reference
+Compose stack in [`deploy/docker/compose.example.yml`](./docker/compose.example.yml).
+No public Syna container image is required; build the image from this repository
+on the deployment host or let Coolify build it from the repository.
 
 ## Docker Compose
 
-1. Copy `deploy/docker/compose.example.yml` to your deployment host.
-2. Set `SYNA_PUBLIC_BASE_URL` to the public HTTPS origin clients will use.
+Use this flow when you are not using Coolify and do not have a container
+registry:
+
+1. Clone or copy this repository to the deployment host.
+2. Edit `deploy/docker/compose.example.yml` and set `SYNA_PUBLIC_BASE_URL` to
+   the public HTTPS origin clients will use.
 3. Mount a persistent host directory to `/var/lib/syna`.
-4. Keep the published backend port bound to localhost and place an HTTPS reverse proxy in front.
+4. Keep the published backend port bound to localhost and place an HTTPS reverse
+   proxy in front.
+5. Start the stack from the repository root:
+
+```bash
+sudo mkdir -p /srv/syna
+sudo chown 10001:10001 /srv/syna
+docker compose -f deploy/docker/compose.example.yml up -d --build
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+The example Compose file builds `deploy/docker/Dockerfile.server` locally. If
+you copy the Compose file elsewhere, update its `build.context` and
+`build.dockerfile` paths so they still point at this repository and Dockerfile.
 
 Persistent data under `/var/lib/syna`:
 
@@ -19,7 +40,8 @@ Persistent data under `/var/lib/syna`:
 
 Recommended Coolify settings:
 
-- Resource type: Public Repository
+- Resource type: Public Repository for a public repo, or the matching private
+  repository integration for a private repo
 - Build pack: Dockerfile
 - Base directory: `/`
 - Dockerfile location: `/deploy/docker/Dockerfile.server`
@@ -62,11 +84,14 @@ Your reverse proxy must provide:
 
 - HTTPS termination
 - WebSocket upgrade support for `/v1/ws`
-- request body limits large enough for encrypted object uploads and snapshot submissions
-  File chunks are limited to 4 MiB plaintext and snapshot objects to 16 MiB plaintext before encryption overhead.
+- request body limits large enough for encrypted object uploads and snapshot
+  submissions; file chunks are limited to 4 MiB plaintext and snapshot objects
+  to 16 MiB plaintext before encryption overhead
 - long-lived idle connections
 
-Do not expose the raw backend listener directly to the public internet. Bind it to localhost or a private interface and publish only the HTTPS reverse-proxy entrypoint.
+Do not expose the raw backend listener directly to the public internet. Bind it
+to localhost or a private interface and publish only the HTTPS reverse-proxy
+entrypoint.
 
 ## Backup And Restore
 
@@ -103,7 +128,8 @@ Monitor:
 Recommended upgrade flow:
 
 1. Back up `/var/lib/syna`.
-2. Build or pull the new server image.
+2. Build the new server image from the updated repository checkout, or pull it
+   from your own registry if you publish one.
 3. Stop the old container.
 4. Start the new container against the same mounted volume.
 5. Verify `/readyz`.

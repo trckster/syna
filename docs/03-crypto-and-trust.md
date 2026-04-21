@@ -198,6 +198,8 @@ Format:
 
 When the user runs `syna disconnect`, the client deletes `server_url`, `workspace_id`, and `workspace_key` from this file.
 
+`syna key show` reads this local file and prints the stored `workspace_key` value. It does not retrieve or recover a key from the server.
+
 ## Key Rotation
 
 Not supported in v1.

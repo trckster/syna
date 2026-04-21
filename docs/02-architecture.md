@@ -88,7 +88,7 @@ The server never sees plaintext paths or plaintext file contents. It only sees o
    - Ed25519 authentication keypair
    - path ID key
    - content encryption keys
-5. The daemon creates the workspace on the server and prints the recovery key once.
+5. The daemon creates the workspace on the server and prints the recovery key with a short safety warning and a note that `syna key show` can display it again on this connected device.
 6. The key is stored locally in plain text as required by product input.
 
 ## Additional Device Connect

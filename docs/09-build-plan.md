@@ -82,7 +82,7 @@ Build next:
 - config and keyring files
 - Unix socket RPC
 - auto-start daemon behavior
-- `syna connect <server-url>`, `syna disconnect`, `syna status`, and CLI help
+- `syna connect <server-url>`, `syna disconnect`, `syna key show`, `syna status`, and CLI help
 
 ### Phase 5: initial sync
 

@@ -8,6 +8,17 @@ without being able to read file contents.
 > Syna is an early v1 implementation for Linux clients and single-server
 > deployments.
 
+## Deployment Model
+
+Syna is distributed to clients through GitHub Releases. Client machines should
+download the latest release archive for their CPU architecture and install the
+`syna` binary from it; they should not clone this repository or build anything.
+
+The server is deployed from this repository. Coolify can build the server
+container directly from the repo, or operators can build the Docker image from
+`deploy/docker/Dockerfile.server`. Syna does not currently publish Debian
+packages or a public server container image.
+
 ## Installation
 
 ### Server Installation With Coolify
@@ -18,9 +29,9 @@ reachable over HTTPS at the same public URL your clients will use, for example
 
 In Coolify:
 
-1. Create a new resource and choose `Public Repository` for this project
-   repository. For a private repository, use the appropriate GitHub App or
-   Deploy Key option instead.
+1. Create a new resource and point Coolify at this repository. Use `Public
+   Repository` for a public repo, or the appropriate GitHub App / Deploy Key
+   option for a private repo.
 2. After Coolify checks the repository, set the build pack to `Dockerfile`.
 3. Set the base directory to `/`.
 4. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
@@ -50,29 +61,43 @@ This value must match the HTTPS URL configured in Coolify's `Domains` field.
 Do not use container-local ephemeral storage for `/var/lib/syna`; it contains
 the SQLite database and encrypted object store.
 
+For non-Coolify Docker deployments, see [`deploy/README.md`](./deploy/README.md).
+
 ### Client Installation On Linux
 
-Install the client from a published package or release binary. You do not need
-to download this repository or build from source on client machines.
+Download the latest Syna release archive from
+[`github.com/trckster/syna/releases/latest`](https://github.com/trckster/syna/releases/latest).
+Choose the archive that matches the client CPU architecture:
 
-If a Debian package is available for your release, install it directly:
+- `syna-<version>-linux-amd64.tar.gz` for typical x86_64 Linux machines
+- `syna-<version>-linux-arm64.tar.gz` for ARM64 Linux machines
+
+Install the client binary from the archive:
 
 ```bash
-sudo apt install ./syna_<version>_linux_amd64.deb
+tar -xzf syna-<version>-linux-amd64.tar.gz
+sudo install -m 0755 syna-<version>-linux-amd64/syna /usr/local/bin/syna
 syna version
 ```
 
-If only release archives are available, install the `syna` binary from the
-archive that matches your CPU architecture:
+Use `linux-arm64` in the archive and extracted directory names on ARM64
+machines.
+
+The release archive also contains `syna-server`; client machines do not need
+that binary. Do not download GitHub's source-code archives for client
+installation; they do not contain built binaries. This repository does not build
+a `.deb` package.
+
+To upgrade a client, install the newer `syna` binary over the old one. If the
+daemon is already running under user systemd, restart it after replacing the
+binary:
 
 ```bash
-curl -LO https://example.com/releases/syna-vX.Y.Z-linux-amd64.tar.gz
-tar -xzf syna-vX.Y.Z-linux-amd64.tar.gz
-sudo install -m 0755 syna-vX.Y.Z-linux-amd64/syna /usr/local/bin/syna
-syna version
+systemctl --user restart syna.service
 ```
 
-Use `linux-arm64` instead of `linux-amd64` on ARM64 machines.
+If user systemd is unavailable, stop any manually launched `syna daemon` process
+and let the next CLI command start it again.
 
 ## First Use
 
@@ -82,9 +107,15 @@ Connect the first Linux device to your server:
 syna connect https://syna.example.com
 ```
 
-Press Enter at the recovery-key prompt to create a new workspace. Syna prints a
-`syna1-...` recovery key once; store it somewhere safe because it is required to
-connect other devices.
+At the recovery-key prompt, press Enter to create a new workspace on a fresh
+server. Syna prints a `syna1-...` recovery key. This key lets other devices
+join the same encrypted workspace, and anyone who has it can access that
+workspace, so store it somewhere safe. On a connected device, show the locally
+stored key again with:
+
+```bash
+syna key show
+```
 
 Start syncing a folder:
 
@@ -105,6 +136,7 @@ Enter the recovery key from the first device when prompted.
 ```text
 syna connect <server-url>   Connect this device to a Syna server
 syna disconnect             Disconnect this device and stop local sync
+syna key show               Print the stored workspace recovery key
 syna add <path>             Start syncing a file or directory
 syna rm <path>              Stop syncing a path without deleting local files
 syna status                 Show sync and connection state
@@ -115,6 +147,8 @@ syna help                   Show command help
 `syna connect` starts or contacts the local background daemon automatically when
 `daemon_auto_start` is enabled. Client config is stored under
 `$XDG_CONFIG_HOME/syna`, and local state is stored under `$XDG_STATE_HOME/syna`.
+After `syna disconnect`, the local stored recovery key is removed; reconnecting
+that device requires entering a recovery key again.
 
 On systems with user systemd, the daemon is managed as:
 
@@ -147,7 +181,8 @@ reverse-proxy, backup, restore, and upgrade guidance.
 
 ## Release Artifacts
 
-The release build emits Linux archives in `dist/`:
+Maintainers build Linux release archives with `./scripts/release.sh` and upload
+them to GitHub Releases:
 
 ```text
 syna-<version>-linux-amd64.tar.gz
@@ -162,8 +197,10 @@ syna-server
 README.md
 ```
 
-Client machines only need the `syna` binary. Servers deployed through Coolify
-use the Dockerfile at `deploy/docker/Dockerfile.server`.
+Client machines only need the `syna` binary from the published release archive.
+Servers deployed through Coolify use the Dockerfile at
+`deploy/docker/Dockerfile.server`. The release script does not produce Debian
+packages.
 
 ## Development
 

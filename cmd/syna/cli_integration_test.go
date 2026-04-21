@@ -38,6 +38,7 @@ func TestCLIHelpDoesNotNeedDaemon(t *testing.T) {
 	for _, want := range []string{
 		"syna connect <server-url>  connect",
 		"syna disconnect            disconnect",
+		"syna key show              print",
 		"syna add <path>            add",
 		"syna rm <path>             stop syncing",
 		"syna status                print",
@@ -66,6 +67,9 @@ func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	if recoveryKey(stdout) == "" {
 		t.Fatalf("connect output did not include generated recovery key:\n%s", stdout)
 	}
+	if !strings.Contains(stdout, "You can show it again on this connected device with: syna key show") {
+		t.Fatalf("connect output did not mention syna key show:\n%s", stdout)
+	}
 	paths := clientPaths(home)
 	for _, path := range []string{paths.ConfigFile, paths.KeyringFile, paths.DBFile, paths.SocketFile, paths.PIDFile} {
 		if _, err := os.Stat(path); err != nil {
@@ -82,6 +86,93 @@ func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	}
 	if status.WorkspaceID == "" || status.ServerURL != server.URL {
 		t.Fatalf("unexpected status after connect: %+v", status)
+	}
+}
+
+func TestCLIKeyShowReadsLocalKeyring(t *testing.T) {
+	bin := buildSynaBinary(t)
+	server := newCLITestServer(t)
+	defer server.Close()
+
+	home := shortTempDir(t, "key-home")
+	t.Cleanup(func() { stopDaemon(t, home) })
+
+	stdout, stderr, err := runSyna(t, bin, home, "", "key", "show")
+	if err == nil {
+		t.Fatalf("expected key show before connect to fail\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "no recovery key is stored; connect to a workspace first") {
+		t.Fatalf("unexpected key show failure before connect\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+
+	stdout, stderr, err = runSyna(t, bin, home, "\n", "connect", server.URL)
+	if err != nil {
+		t.Fatalf("connect: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	key := recoveryKey(stdout)
+	if key == "" {
+		t.Fatalf("missing recovery key in output:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Anyone with it can access the encrypted workspace; store it safely.") {
+		t.Fatalf("connect output missing recovery key warning:\n%s", stdout)
+	}
+
+	stopDaemon(t, home)
+	paths := clientPaths(home)
+	_ = os.Remove(paths.SocketFile)
+	_ = os.Remove(paths.PIDFile)
+	stdout, stderr, err = runSyna(t, bin, home, "", "key", "show")
+	if err != nil {
+		t.Fatalf("key show without daemon: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if stdout != key+"\n" {
+		t.Fatalf("key show stdout = %q want %q", stdout, key+"\n")
+	}
+	if stderr != "" {
+		t.Fatalf("key show should not write stderr, got %q", stderr)
+	}
+	if _, err := os.Stat(paths.SocketFile); !os.IsNotExist(err) {
+		t.Fatalf("key show should not create or contact daemon socket, stat err=%v", err)
+	}
+	if _, err := os.Stat(paths.PIDFile); !os.IsNotExist(err) {
+		t.Fatalf("key show should not start daemon, pid file stat err=%v", err)
+	}
+
+	if stdout, stderr, err = runSyna(t, bin, home, "", "disconnect"); err != nil {
+		t.Fatalf("disconnect: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	stdout, stderr, err = runSyna(t, bin, home, "", "key", "show")
+	if err == nil {
+		t.Fatalf("expected key show after disconnect to fail\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "no recovery key is stored; connect to a workspace first") {
+		t.Fatalf("unexpected key show failure after disconnect\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+func TestCLIKeyUsageRejectsUnsupportedForms(t *testing.T) {
+	bin := buildSynaBinary(t)
+	home := shortTempDir(t, "key-usage")
+
+	for _, args := range [][]string{
+		{"key"},
+		{"key", "list"},
+		{"key", "show", "extra"},
+	} {
+		stdout, stderr, err := runSyna(t, bin, home, "", args...)
+		if err == nil {
+			t.Fatalf("expected syna %s to fail\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), stdout, stderr)
+		}
+		requireExitCode(t, err, 2)
+		if !strings.Contains(stdout, "syna key show              print the stored workspace recovery key") {
+			t.Fatalf("usage for syna %s missing key show\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), stdout, stderr)
+		}
+		if stderr != "" {
+			t.Fatalf("usage error should not write stderr, got %q", stderr)
+		}
+	}
+	if _, err := os.Stat(clientPaths(home).SocketFile); !os.IsNotExist(err) {
+		t.Fatalf("unsupported key forms should not create or contact daemon socket, stat err=%v", err)
 	}
 }
 
@@ -426,6 +517,17 @@ func runSyna(t *testing.T, bin, home, stdin string, args ...string) (string, str
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func requireExitCode(t *testing.T, err error, want int) {
+	t.Helper()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("error %v is not an exit error", err)
+	}
+	if got := exitErr.ExitCode(); got != want {
+		t.Fatalf("exit code = %d want %d", got, want)
+	}
 }
 
 func clientEnv(t *testing.T, home string) []string {

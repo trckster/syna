@@ -253,6 +253,8 @@ Use XDG paths:
 - `false`: Syna does not enable persistent auto-start on its own
 
 `server_url` and `workspace_id` are `null` or absent after `syna disconnect`.
+The local keyring's stored recovery key is also removed, so `syna key show`
+fails until the client connects to a workspace again.
 
 ## Client SQLite Schema
 

@@ -48,9 +48,17 @@ Mounted data:
 
 ## Plain Docker Run
 
-Example:
+Build the server image from a repository checkout on the deployment host:
 
 ```bash
+docker build -f deploy/docker/Dockerfile.server -t syna-server:local .
+```
+
+Then run it with a persistent host directory:
+
+```bash
+sudo mkdir -p /srv/syna
+sudo chown 10001:10001 /srv/syna
 docker run -d \
   --name syna-server \
   --restart unless-stopped \
@@ -59,7 +67,7 @@ docker run -d \
   -e SYNA_DATA_DIR=/var/lib/syna \
   -e SYNA_PUBLIC_BASE_URL=https://syna.example.com \
   -v /srv/syna:/var/lib/syna \
-  ghcr.io/example/syna-server:latest serve
+  syna-server:local
 ```
 
 This intentionally binds only to localhost. Put a reverse proxy in front.
@@ -69,7 +77,9 @@ This intentionally binds only to localhost. Put a reverse proxy in front.
 ```yaml
 services:
   syna-server:
-    image: ghcr.io/example/syna-server:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.server
     command: ["serve"]
     restart: unless-stopped
     environment:
@@ -85,11 +95,22 @@ services:
       - /srv/syna:/var/lib/syna
 ```
 
+Run the example from the repository root:
+
+```bash
+docker compose -f deploy/docker/compose.example.yml up -d --build
+```
+
+If the Compose file is copied outside the repository, adjust `build.context` and
+`build.dockerfile` so Docker can still see the repository root and
+`deploy/docker/Dockerfile.server`.
+
 ## Coolify Deployment
 
 Coolify configuration requirements:
 
-- resource type: Public Repository
+- resource type: Public Repository for a public repo, or the matching private
+  repository integration for a private repo
 - build pack: Dockerfile
 - base directory: `/`
 - Dockerfile location: `/deploy/docker/Dockerfile.server`
@@ -128,7 +149,8 @@ Restore procedure:
 ## Upgrade Procedure
 
 1. back up the mounted volume
-2. pull the new image
+2. build the new image from the updated repository checkout, or let Coolify
+   rebuild from the updated repository
 3. stop the old container
 4. start the new container
 5. verify `/readyz`

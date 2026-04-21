@@ -17,6 +17,7 @@ The user-facing CLI for v1 is:
 ```text
 syna connect <server-url>
 syna disconnect
+syna key show
 syna add <path>
 syna rm <path>
 syna status
@@ -93,6 +94,7 @@ Silent overwrite is not allowed. If two clients edit the same path concurrently 
 Syna v1 is complete when all of the following are true:
 
 - A first client can connect to a fresh server, create a workspace, and print a recovery key.
+- A connected client can print its locally stored recovery key with `syna key show`.
 - A second client can connect to the same server, enter that key once, and restore the same roots under its own `$HOME`.
 - `syna help`, `syna -h`, and `syna --help` print the CLI usage summary.
 - Adding a root uploads its initial state and begins live watching.

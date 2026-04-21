@@ -43,12 +43,13 @@ RPC responsibilities:
 
 - `syna connect <server-url>` asks the daemon to connect or create the workspace
 - `syna disconnect` asks the daemon to stop syncing this device and clear local workspace state
+- `syna key show` reads the locally stored recovery key from `keyring.json` without contacting the daemon or server
 - `syna add <path>` asks the daemon to validate, scan, and add a root
 - `syna rm <path>` asks the daemon to stop watching and submit `root_remove`
 - `syna status` asks the daemon for a snapshot of local and remote sync state
 - `syna help`, `syna -h`, and `syna --help` print CLI usage without contacting the daemon
 
-The daemon owns all writes to `config.json`, `keyring.json`, and `client.db`. The CLI only renders prompts and command output.
+The daemon owns all writes to `config.json`, `keyring.json`, and `client.db`. The CLI only renders prompts and command output, except that `syna key show` may read `keyring.json` directly.
 
 ## Daemon Startup And Recovery
 
@@ -112,9 +113,24 @@ The command stores:
 - workspace key in `keyring.json`
 - session state in the local DB
 
-If this is the first client for that server, print the generated recovery key once to stdout.
+If this is the first client for that server, print the generated recovery key to stdout and explain that the key lets other devices join the workspace, anyone with it can access the encrypted workspace, and it should be stored safely. The generated `syna1-...` key remains on its own line so scripts can parse it.
+
+The output must also tell the user they can show the locally stored key again on the connected device with `syna key show`.
 
 If the installation is already connected to a different server, the command must fail with a clear message telling the user to run `syna disconnect` first.
+
+### `syna key show`
+
+Print the locally stored workspace recovery key to stdout.
+
+Behavior:
+
+- read `~/.config/syna/keyring.json` directly
+- print only the `workspace_key` value plus a trailing newline
+- do not contact the daemon
+- do not contact the server
+- fail clearly if no workspace key is stored
+- reject unsupported forms such as `syna key`, `syna key list`, or extra arguments with usage and exit code 2
 
 ### `syna help`, `syna -h`, `syna --help`
 
@@ -123,7 +139,7 @@ Print the CLI usage summary and exit.
 Behavior:
 
 - list every supported user-facing command
-- include one-line descriptions for `connect`, `disconnect`, `add`, `rm`, and `status`
+- include one-line descriptions for `connect`, `disconnect`, `key show`, `add`, `rm`, and `status`
 - do not require local daemon availability
 - do not contact the server
 

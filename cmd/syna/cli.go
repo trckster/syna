@@ -34,6 +34,7 @@ var commands = map[string]commandFunc{
 	"daemon":     daemonCommand,
 	"connect":    connectCommand,
 	"disconnect": disconnectCommand,
+	"key":        keyCommand,
 	"add":        addCommand,
 	"rm":         removeCommand,
 	"status":     statusCommand,
@@ -92,6 +93,9 @@ func connectCommand(paths commoncfg.ClientPaths, args []string) error {
 	}
 	if resp.GeneratedRecoveryKey != "" {
 		fmt.Println(resp.GeneratedRecoveryKey)
+		fmt.Println("This recovery key lets other devices join the workspace.")
+		fmt.Println("Anyone with it can access the encrypted workspace; store it safely.")
+		fmt.Println("You can show it again on this connected device with: syna key show")
 	}
 	fmt.Printf("workspace: %s\n", resp.WorkspaceID)
 	for _, warning := range resp.Warnings {
@@ -106,6 +110,22 @@ func disconnectCommand(paths commoncfg.ClientPaths, _ []string) error {
 		return err
 	}
 	return agentrpc.Call(socket, "disconnect", nil, nil)
+}
+
+func keyCommand(paths commoncfg.ClientPaths, args []string) error {
+	if len(args) != 1 || args[0] != "show" {
+		usage()
+		return exitCode(2)
+	}
+	keyring, err := configstore.New(paths).LoadKeyring()
+	if err != nil {
+		return err
+	}
+	if keyring.WorkspaceKey == "" {
+		return errors.New("no recovery key is stored; connect to a workspace first")
+	}
+	fmt.Println(keyring.WorkspaceKey)
+	return nil
 }
 
 func addCommand(paths commoncfg.ClientPaths, args []string) error {
@@ -150,6 +170,7 @@ func usage() {
 	fmt.Println(`usage:
 syna connect <server-url>  connect this device to a workspace
 syna disconnect            disconnect this device and leave local files untouched
+syna key show              print the stored workspace recovery key
 syna add <path>            add a file or directory under $HOME to sync
 syna rm <path>             stop syncing a previously added path
 syna status                print workspace, connection, warning, and root status

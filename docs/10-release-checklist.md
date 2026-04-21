@@ -23,6 +23,11 @@ Run this checklist before publishing a server or client build.
    - run `syna-server doctor` against the same volume
    - restart the container and verify data remains available
 13. Verify first-client and second-client flows against the release binaries.
-14. Verify `SYNA_PUBLIC_BASE_URL` is `https://...` in production and that `SYNA_ALLOW_HTTP` is not enabled.
-15. Verify the backend is reachable only through an HTTPS reverse proxy and the raw backend port is not publicly exposed.
-16. Verify object-store disk usage, free space, and file-descriptor limits are within operating thresholds before rollout.
+14. Upload the Linux release archives to the GitHub Release for the version tag:
+   - `syna-<version>-linux-amd64.tar.gz`
+   - `syna-<version>-linux-arm64.tar.gz`
+15. Verify the latest GitHub Release exposes those archives and does not require
+    client users to build from source.
+16. Verify `SYNA_PUBLIC_BASE_URL` is `https://...` in production and that `SYNA_ALLOW_HTTP` is not enabled.
+17. Verify the backend is reachable only through an HTTPS reverse proxy and the raw backend port is not publicly exposed.
+18. Verify object-store disk usage, free space, and file-descriptor limits are within operating thresholds before rollout.
