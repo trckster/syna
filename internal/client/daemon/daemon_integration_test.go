@@ -655,6 +655,67 @@ func TestIntegrationRemoteOnlyCreateRaceDoesNotCreateConflictCopy(t *testing.T) 
 	}
 }
 
+func TestIntegrationRecreateAfterDeleteUsesDeletedPathHead(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	root, err := d.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+
+	note := filepath.Join(rootDir, "note.txt")
+	if err := os.WriteFile(note, []byte("first\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(first): %v", err)
+	}
+	if err := d.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+		t.Fatalf("rescan create: %v", err)
+	}
+	if err := os.Remove(note); err != nil {
+		t.Fatalf("Remove(note): %v", err)
+	}
+	if err := d.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+		t.Fatalf("rescan delete: %v", err)
+	}
+	if err := os.WriteFile(note, []byte("second\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(second): %v", err)
+	}
+	if err := d.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+		t.Fatalf("rescan recreate: %v", err)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(rootDir, "note.syna-conflict-*"))
+	if err != nil {
+		t.Fatalf("Glob(conflicts): %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no conflict copy after recreate, got %v", matches)
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		t.Fatalf("EntriesForRoot: %v", err)
+	}
+	entry, ok := entries["note.txt"]
+	if !ok || entry.Deleted {
+		t.Fatalf("expected active recreated entry, got %+v ok=%v", entry, ok)
+	}
+}
+
 func TestIntegrationBootstrapIntoEmptyTarget(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()

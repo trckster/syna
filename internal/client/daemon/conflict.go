@@ -28,11 +28,11 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 	if err := d.applyCurrentRemoteHead(ctx, conflict.CurrentSeq); err != nil {
 		return err
 	}
-	matches, err := d.remoteHeadMatchesLocalFile(root.RootID, item)
+	retryOnly, matches, err := d.remoteHeadAllowsRetry(root.RootID, item)
 	if err != nil {
 		return err
 	}
-	if matches {
+	if retryOnly || matches {
 		return nil
 	}
 	for attempt := 0; attempt < 5; attempt++ {
@@ -83,16 +83,19 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 	return fmt.Errorf("conflict copy upload retries exhausted")
 }
 
-func (d *Daemon) remoteHeadMatchesLocalFile(rootID string, item scanner.Entry) (bool, error) {
+func (d *Daemon) remoteHeadAllowsRetry(rootID string, item scanner.Entry) (bool, bool, error) {
 	entries, err := d.stateDB.EntriesForRoot(rootID)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	current, ok := entries[item.RelPath]
-	if !ok || current.Deleted || current.Kind != protocol.RootKindFile {
-		return false, nil
+	if !ok || current.Deleted {
+		return true, false, nil
 	}
-	return current.ContentSHA256 == item.ContentSHA256, nil
+	if current.Kind != protocol.RootKindFile {
+		return false, false, nil
+	}
+	return false, current.ContentSHA256 == item.ContentSHA256, nil
 }
 
 func (d *Daemon) stageLocalFileCopy(sourcePath string) (string, func(), error) {

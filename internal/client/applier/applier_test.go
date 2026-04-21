@@ -95,8 +95,12 @@ func TestApplyEventStageOnlyPreservesLocalDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EntriesForRoot(after delete): %v", err)
 	}
-	if _, ok := entries[relPath]; ok {
-		t.Fatalf("expected staged entry to be removed after delete")
+	entry, ok = entries[relPath]
+	if !ok || !entry.Deleted {
+		t.Fatalf("expected staged entry to be tombstoned after delete, got %+v ok=%v", entry, ok)
+	}
+	if entry.CurrentSeq != deleteEvent.Seq {
+		t.Fatalf("delete current seq = %d want %d", entry.CurrentSeq, deleteEvent.Seq)
 	}
 }
 

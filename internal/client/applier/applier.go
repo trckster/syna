@@ -184,7 +184,7 @@ func ApplyEvent(ctx context.Context, conn *connector.Client, keys *commoncrypto.
 		if err := json.Unmarshal(plaintext, &payload); err != nil {
 			return err
 		}
-		relPath, target, err := resolveDeleteTarget(root, payload.Path, event.PathID, keys)
+		relPath, target, pathID, err := resolveDeleteTarget(root, payload.Path, event.PathID, keys)
 		if err != nil {
 			return err
 		}
@@ -197,7 +197,12 @@ func ApplyEvent(ctx context.Context, conn *connector.Client, keys *commoncrypto.
 				return err
 			}
 		}
-		return stateDB.DeleteEntry(root.RootID, relPath)
+		return stateDB.MarkEntryDeleted(state.Entry{
+			RootID:     root.RootID,
+			RelPath:    relPath,
+			PathID:     pathID,
+			CurrentSeq: event.Seq,
+		})
 	default:
 		return fmt.Errorf("unsupported event type %s", event.EventType)
 	}
@@ -225,9 +230,9 @@ func validateFilePutTarget(keys *commoncrypto.DerivedKeys, root state.Root, rawP
 	return relPath, target, pathID, nil
 }
 
-func resolveDeleteTarget(root state.Root, rawPath string, eventPathID *string, keys *commoncrypto.DerivedKeys) (string, string, error) {
-	relPath, target, _, err := resolveContentTarget(keys, root, rawPath, false, eventPathID)
-	return relPath, target, err
+func resolveDeleteTarget(root state.Root, rawPath string, eventPathID *string, keys *commoncrypto.DerivedKeys) (string, string, string, error) {
+	relPath, target, pathID, err := resolveContentTarget(keys, root, rawPath, false, eventPathID)
+	return relPath, target, pathID, err
 }
 
 func resolveContentTarget(keys *commoncrypto.DerivedKeys, root state.Root, rawPath string, allowRoot bool, eventPathID *string) (string, string, string, error) {

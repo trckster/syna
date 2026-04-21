@@ -368,6 +368,17 @@ func (db *DB) UpsertEntry(entry Entry) error {
 	return insertEntry(db.SQL, entry)
 }
 
+func (db *DB) MarkEntryDeleted(entry Entry) error {
+	entry.Deleted = true
+	entry.ContentSHA256 = ""
+	entry.SizeBytes = 0
+	entry.Mode = 0
+	entry.MTimeNS = 0
+	entry.Inode = 0
+	entry.Device = 0
+	return insertEntry(db.SQL, entry)
+}
+
 func insertEntry(exec interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }, entry Entry) error {

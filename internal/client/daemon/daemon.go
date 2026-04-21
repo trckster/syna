@@ -1005,6 +1005,9 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 		if _, ok := next[relPath]; ok {
 			continue
 		}
+		if old.Deleted {
+			continue
+		}
 		suppressDelete, err := d.shouldSuppressIgnoredDelete(rootID, relPath, time.Now().UTC())
 		if err != nil {
 			return err
@@ -1013,7 +1016,8 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			continue
 		}
 		payload := protocol.DeletePayload{Path: relPath}
-		if _, err := d.submitEvent(ctx, rootID, old.PathID, "", protocol.EventDelete, &old.CurrentSeq, payload, nil); err != nil {
+		resp, err := d.submitEvent(ctx, rootID, old.PathID, "", protocol.EventDelete, &old.CurrentSeq, payload, nil)
+		if err != nil {
 			if allowRetry {
 				var conflict *PathConflictError
 				if errors.As(err, &conflict) {
@@ -1028,7 +1032,13 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			}
 			return err
 		}
-		if err := d.stateDB.DeleteEntry(rootID, relPath); err != nil {
+		if err := d.stateDB.MarkEntryDeleted(state.Entry{
+			RootID:     rootID,
+			RelPath:    relPath,
+			PathID:     old.PathID,
+			Kind:       old.Kind,
+			CurrentSeq: resp.AcceptedSeq,
+		}); err != nil {
 			return err
 		}
 	}
@@ -1040,7 +1050,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			baseSeq = old.CurrentSeq
 		}
 		if item.Kind == protocol.RootKindDir {
-			if ok && old.Kind == protocol.RootKindDir && old.Mode == item.Mode && old.MTimeNS == item.MTimeNS {
+			if ok && !old.Deleted && old.Kind == protocol.RootKindDir && old.Mode == item.Mode && old.MTimeNS == item.MTimeNS {
 				continue
 			}
 			resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventDirPut, &baseSeq, protocol.DirPutPayload{
@@ -1077,7 +1087,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			}
 			continue
 		}
-		if ok && old.Kind == protocol.RootKindFile && old.ContentSHA256 == item.ContentSHA256 && old.Mode == item.Mode && old.MTimeNS == item.MTimeNS {
+		if ok && !old.Deleted && old.Kind == protocol.RootKindFile && old.ContentSHA256 == item.ContentSHA256 && old.Mode == item.Mode && old.MTimeNS == item.MTimeNS {
 			continue
 		}
 		suppressEntry, err := d.shouldSuppressIgnoredEntry(rootID, item, time.Now().UTC())
