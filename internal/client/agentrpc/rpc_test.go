@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -61,5 +62,43 @@ func TestCallWithProgressStreamsUpdatesBeforeFinalResponse(t *testing.T) {
 	}
 	if resp["status"] != "ok" {
 		t.Fatalf("response = %+v", resp)
+	}
+}
+
+func TestCallReportsClosedConnectionClearly(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "agent.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer listener.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("Accept: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var req Request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			t.Errorf("Decode request: %v", err)
+		}
+	}()
+
+	err = Call(socketPath, "status", nil, nil)
+	<-done
+
+	if err == nil {
+		t.Fatalf("Call succeeded, want closed-connection error")
+	}
+	if strings.Contains(err.Error(), "EOF") {
+		t.Fatalf("error should not expose raw EOF: %v", err)
+	}
+	if !strings.Contains(err.Error(), "daemon closed the connection before sending a response") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

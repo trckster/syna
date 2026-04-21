@@ -18,18 +18,19 @@ In Coolify:
 1. Create a new resource and point Coolify at this repository. Use `Public
    Repository` for a public repo, or the appropriate GitHub App / Deploy Key
    option for a private repo.
-2. After Coolify checks the repository, set the build pack to `Dockerfile`.
-3. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
-4. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
-5. In Domains, set the HTTPS URL clients will use, for example
+2. In Git Source, set Branch to `master`.
+3. After Coolify checks the repository, set the build pack to `Dockerfile`.
+4. Set the Dockerfile location to `/deploy/docker/Dockerfile.server`.
+5. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
+6. In Domains, set the HTTPS URL clients will use, for example
    `https://syna.example.com`.
-6. In Environment Variables, add `SYNA_MAX_WORKSPACES=1` to allow only one
+7. In Environment Variables, add `SYNA_MAX_WORKSPACES=1` to allow only one
    workspace key; leave it unset or set `0` for the default unlimited threshold.
-7. In Persistent Storage, add a Docker volume:
+8. In Persistent Storage, add a Docker volume:
    - Name: `syna-data`
    - Source Path: leave empty
    - Destination Path: `/var/lib/syna`
-8. In Healthcheck, set port to `8080` and path to `/readyz`.
+9. In Healthcheck, set port to `8080` and path to `/readyz`.
 
 Do not use container-local ephemeral storage for `/var/lib/syna`; it contains
 the SQLite database and encrypted object store.

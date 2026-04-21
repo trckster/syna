@@ -41,6 +41,10 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		out.Result = agentrpc.EncodeResult(resp)
 	}
 	_ = enc.Encode(out)
+	if req.Method == "disconnect" && err == nil {
+		_ = conn.Close()
+		d.stopAfterDisconnect()
+	}
 }
 
 func (d *Daemon) dispatchRPC(req agentrpc.Request, progress AddProgressFunc) (any, error) {
@@ -52,7 +56,7 @@ func (d *Daemon) dispatchRPC(req agentrpc.Request, progress AddProgressFunc) (an
 		}
 		return d.Connect(context.Background(), args)
 	case "disconnect":
-		return nil, d.Disconnect(context.Background())
+		return d.DisconnectWithResponse(context.Background())
 	case "add":
 		var args AddRequest
 		if err := json.Unmarshal(req.Params, &args); err != nil {

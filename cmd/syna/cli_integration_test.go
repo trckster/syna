@@ -182,7 +182,7 @@ func TestCLIKeyShowReadsLocalKeyring(t *testing.T) {
 	if stdout, stderr, err = runSyna(t, bin, home, "", "disconnect"); err != nil {
 		t.Fatalf("disconnect: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "Disconnected this device. Local files were left untouched.") {
+	if !strings.Contains(stdout, "Successfully disconnected this device. Local files were left untouched.") {
 		t.Fatalf("disconnect output missing confirmation:\n%s", stdout)
 	}
 	stdout, stderr, err = runSyna(t, bin, home, "", "key", "show")
@@ -349,7 +349,7 @@ func TestCLIRealDaemonsSyncCreateEditAndDelete(t *testing.T) {
 	if stdout, stderr, err = runSyna(t, bin, homeA, "", "disconnect"); err != nil {
 		t.Fatalf("disconnect A: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "Disconnected this device. Local files were left untouched.") {
+	if !strings.Contains(stdout, "Successfully disconnected this device. Local files were left untouched.") {
 		t.Fatalf("disconnect output missing confirmation:\n%s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(rootA, "deep", "note.txt")); err != nil {
@@ -703,6 +703,7 @@ stop_service() {
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true
     fi
+    rm -f "$pid_file"
   fi
 }
 
@@ -730,7 +731,11 @@ case "$1" in
     fi
     ;;
   disable)
+    if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
+      exit 0
+    fi
     if [ "$#" -eq 3 ] && [ "$2" = "--now" ] && [ "$3" = "syna.service" ]; then
+      stop_service
       exit 0
     fi
     ;;

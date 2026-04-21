@@ -61,7 +61,7 @@ WantedBy=default.target
 }
 
 func (d *Daemon) disableUserService(ctx context.Context) error {
-	return runCommand(exec.CommandContext(ctx, "systemctl", "--user", "disable", "--now", "syna.service"))
+	return runCommand(exec.CommandContext(ctx, "systemctl", "--user", "disable", "syna.service"))
 }
 
 func runCommand(cmd *exec.Cmd) error {

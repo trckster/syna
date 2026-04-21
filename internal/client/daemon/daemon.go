@@ -66,6 +66,10 @@ type ConnectResponse struct {
 	Warnings             []string `json:"warnings,omitempty"`
 }
 
+type DisconnectResponse struct {
+	Warnings []string `json:"warnings,omitempty"`
+}
+
 type AddRequest struct {
 	Path string `json:"path"`
 }
@@ -202,6 +206,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		_ = os.Remove(d.paths.SocketFile)
 		_ = os.Remove(d.paths.PIDFile)
 	}()
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
 	_ = os.Chmod(d.paths.SocketFile, 0o600)
 
 	d.mu.Lock()
@@ -332,13 +340,15 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 }
 
 func (d *Daemon) Disconnect(ctx context.Context) error {
+	_, err := d.DisconnectWithResponse(ctx)
+	return err
+}
+
+func (d *Daemon) DisconnectWithResponse(ctx context.Context) (*DisconnectResponse, error) {
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.shutdown != nil {
-		// The daemon keeps running; this just detaches the workspace.
-	}
 	roots, _ := d.stateDB.ListRoots()
 	for _, root := range roots {
 		d.watcher.RemoveRoot(root.RootID)
@@ -354,20 +364,31 @@ func (d *Daemon) Disconnect(ctx context.Context) error {
 	d.keys = nil
 	d.conn = nil
 	if err := d.configs.SaveConfig(d.cfg); err != nil {
-		return err
+		return nil, err
 	}
 	if err := d.configs.ClearKeyring(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := d.stateDB.ClearWorkspace(); err != nil {
-		return err
+		return nil, err
 	}
-	if err := d.disableUserService(ctx); err != nil {
-		_ = d.stateDB.UpsertWarning("service:disable", "background service could not be disabled: "+err.Error(), time.Now().UTC())
-	} else {
-		_ = d.stateDB.ClearWarningsWithPrefix("service:disable")
+	var warnings []string
+	if d.cfg.DaemonAutoStart {
+		if err := d.disableUserService(ctx); err != nil {
+			warning := "background service could not be disabled: " + err.Error()
+			warnings = append(warnings, warning)
+			_ = d.stateDB.UpsertWarning("service:disable", warning, time.Now().UTC())
+		} else {
+			_ = d.stateDB.ClearWarningsWithPrefix("service:disable")
+		}
 	}
-	return nil
+	return &DisconnectResponse{Warnings: warnings}, nil
+}
+
+func (d *Daemon) stopAfterDisconnect() {
+	if d.shutdown != nil {
+		d.shutdown()
+	}
 }
 
 func (d *Daemon) AddRoot(ctx context.Context, input string) error {

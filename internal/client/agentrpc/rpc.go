@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 )
 
@@ -61,7 +63,10 @@ func call(socketPath, method string, req any, resp any, streamProgress bool, onP
 	for {
 		var out Response
 		if err := dec.Decode(&out); err != nil {
-			return err
+			if errors.Is(err, io.EOF) {
+				return errors.New("daemon closed the connection before sending a response")
+			}
+			return fmt.Errorf("read daemon response: %w", err)
 		}
 		if out.Progress != nil {
 			if onProgress != nil {

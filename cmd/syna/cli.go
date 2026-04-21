@@ -113,10 +113,14 @@ func disconnectCommand(paths commoncfg.ClientPaths, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if err := agentrpc.Call(socket, "disconnect", nil, nil); err != nil {
+	var resp daemon.DisconnectResponse
+	if err := agentrpc.Call(socket, "disconnect", nil, &resp); err != nil {
 		return err
 	}
-	fmt.Println("Disconnected this device. Local files were left untouched.")
+	fmt.Println("Successfully disconnected this device. Local files were left untouched.")
+	for _, warning := range resp.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
+	}
 	return nil
 }
 
