@@ -104,6 +104,10 @@ func (db *DB) Migrate() error {
 			created_at TIMESTAMP NOT NULL,
 			last_accessed_at TIMESTAMP NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS server_metrics (
+			key TEXT PRIMARY KEY,
+			value INTEGER NOT NULL
+		);`,
 		`INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);`,
 	}
 	for _, stmt := range stmts {
@@ -115,6 +119,9 @@ func (db *DB) Migrate() error {
 		return err
 	}
 	if _, err := db.SQL.Exec(`ALTER TABLE session_challenges ADD COLUMN device_name TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := db.SQL.Exec(`CREATE TABLE IF NOT EXISTS server_metrics (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`); err != nil {
 		return err
 	}
 	if _, err := db.SQL.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)`, LatestSchemaVersion); err != nil {

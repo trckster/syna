@@ -51,7 +51,15 @@ func (a *API) handleObjects(w http.ResponseWriter, r *http.Request) {
 		}
 		defer file.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = io.Copy(w, file)
+		n, err := io.Copy(w, file)
+		if n > 0 {
+			if metricErr := a.db.AddTransferredBytes(n); metricErr != nil && a.logger != nil {
+				a.logger.Printf("record transferred bytes: %v", metricErr)
+			}
+		}
+		if err != nil && a.logger != nil {
+			a.logger.Printf("download object %s: %v", objectID, err)
+		}
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 	}

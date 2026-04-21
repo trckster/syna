@@ -40,6 +40,40 @@ func TestQueueRootRescanDedupes(t *testing.T) {
 	}
 }
 
+func TestQueueRootRemoveDedupes(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "client.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	first := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	second := first.Add(10 * time.Second)
+	if err := db.QueueRootRemove("root-1", first); err != nil {
+		t.Fatalf("QueueRootRemove(first): %v", err)
+	}
+	if err := db.QueueRootRemove("root-1", second); err != nil {
+		t.Fatalf("QueueRootRemove(second): %v", err)
+	}
+
+	ops, err := db.ListPendingOps()
+	if err != nil {
+		t.Fatalf("ListPendingOps: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 queued op, got %d", len(ops))
+	}
+	if ops[0].CreatedAt.UTC() != first {
+		t.Fatalf("expected original created_at to be preserved, got %s", ops[0].CreatedAt.UTC())
+	}
+	if ops[0].OpType != "root_remove" {
+		t.Fatalf("unexpected op type %q", ops[0].OpType)
+	}
+}
+
 func TestPendingOpsPersistBackoffAndReadyFiltering(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "client.db"))
 	if err != nil {

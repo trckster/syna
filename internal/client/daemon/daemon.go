@@ -503,11 +503,7 @@ func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
 	if _, err := d.submitEvent(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
 		return err
 	}
-	d.watcher.RemoveRoot(root.RootID)
-	if err := d.stateDB.SetRootState(root.RootID, protocol.RootStateRemoved); err != nil {
-		return err
-	}
-	return d.stateDB.DeleteRootState(root.RootID)
+	return d.markRootRemoved(*root)
 }
 
 func rootForRemove(roots []state.Root, absPath, homeRelPath string) (*state.Root, error) {
@@ -994,12 +990,7 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 		if root == nil {
 			return nil
 		}
-		d.watcher.RemoveRoot(root.RootID)
-		d.clearStagedRoot(root.RootID)
-		if err := d.stateDB.SetRootState(root.RootID, protocol.RootStateRemoved); err != nil {
-			return err
-		}
-		if err := d.stateDB.DeleteRootState(root.RootID); err != nil {
+		if err := d.markRootRemoved(*root); err != nil {
 			return err
 		}
 		return d.stateDB.AdvanceLastSeq(event.Seq)
@@ -1077,12 +1068,18 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 	if err != nil {
 		return err
 	}
+	if root.State != protocol.RootStateActive {
+		return nil
+	}
 	subtreeHint := normalizeRescanHint(relPathHint)
 	scan, err := scanner.ScanSubtree(root.TargetAbsPath, subtreeHint)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if errors.Is(err, os.ErrNotExist) {
+		if root.Kind == protocol.RootKindDir && rootPathMissing(root.TargetAbsPath) {
+			return d.handleDeletedRoot(ctx, *root, queueRetryable)
+		}
 		scan = &scanner.Result{RootKind: root.Kind}
 	}
 	if scan != nil {
@@ -1270,6 +1267,49 @@ func (d *Daemon) recordScanWarnings(root state.Root, warnings []string) error {
 		}
 	}
 	return nil
+}
+
+func (d *Daemon) handleDeletedRoot(ctx context.Context, root state.Root, queueRetryable bool) error {
+	if root.State != protocol.RootStateActive {
+		return nil
+	}
+	if _, err := d.submitEvent(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
+		if isBenignRootRemoveError(err) {
+			return d.markRootRemoved(root)
+		}
+		if queueRetryable && isRetryableSyncError(err) {
+			if err := d.markRootRemoved(root); err != nil {
+				return err
+			}
+			if err := d.stateDB.QueueRootRemove(root.RootID, time.Now().UTC()); err != nil {
+				return err
+			}
+			_ = d.stateDB.SetConnectionStateWithKind(protocol.ConnectionDegraded, lifecycleKind(err, protocol.IssueTransport), err.Error())
+			return nil
+		}
+		return err
+	}
+	return d.markRootRemoved(root)
+}
+
+func (d *Daemon) markRootRemoved(root state.Root) error {
+	d.watcher.RemoveRoot(root.RootID)
+	d.clearStagedRoot(root.RootID)
+	if err := d.stateDB.ClearWarningsWithPrefix("watcher:" + root.RootID); err != nil {
+		return err
+	}
+	if err := d.stateDB.ClearWarningsWithPrefix("scanner:" + root.RootID + ":"); err != nil {
+		return err
+	}
+	if err := d.stateDB.SetRootState(root.RootID, protocol.RootStateRemoved); err != nil {
+		return err
+	}
+	return d.stateDB.DeleteRootState(root.RootID)
+}
+
+func rootPathMissing(path string) bool {
+	_, err := os.Lstat(path)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func (d *Daemon) addWatcherRoot(rootID, target string) {
@@ -1506,6 +1546,15 @@ func (d *Daemon) flushPendingOps(ctx context.Context) error {
 			if err := d.stateDB.DeletePendingOp(op.OpID); err != nil {
 				return err
 			}
+		case "root_remove":
+			_, err := d.submitEvent(ctx, op.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: op.RootID}, nil)
+			if err != nil && !isBenignRootRemoveError(err) {
+				_ = d.stateDB.BumpPendingOpRetry(op.OpID, err.Error(), time.Now().UTC())
+				return err
+			}
+			if err := d.stateDB.DeletePendingOp(op.OpID); err != nil {
+				return err
+			}
 		default:
 			if err := d.stateDB.DeletePendingOp(op.OpID); err != nil {
 				return err
@@ -1689,6 +1738,14 @@ func isRetryableSyncError(err error) bool {
 		}
 	}
 	return false
+}
+
+func isBenignRootRemoveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "root already removed") || strings.Contains(message, "unknown root")
 }
 
 func validateServerURL(serverURL string) error {

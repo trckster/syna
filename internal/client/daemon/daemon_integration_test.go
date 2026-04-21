@@ -424,6 +424,65 @@ func TestIntegrationStatusSurfacesScannerWarnings(t *testing.T) {
 	}
 }
 
+func TestIntegrationDeletedWatchedDirectoryBecomesRemovedRoot(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(note): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	root, err := d.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	if err := d.stateDB.UpsertWarning("watcher:"+root.RootID, "watcher could not monitor stale root", time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertWarning(watcher): %v", err)
+	}
+	if err := d.stateDB.UpsertWarning("scanner:"+root.RootID+":0", "notes: ignored symlink: stale", time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertWarning(scanner): %v", err)
+	}
+
+	if err := os.RemoveAll(rootDir); err != nil {
+		t.Fatalf("RemoveAll(root): %v", err)
+	}
+	if err := d.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+		t.Fatalf("rescan deleted root: %v", err)
+	}
+
+	status, err := d.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.LastError != "" || len(status.Warnings) != 0 || len(status.Issues) != 0 {
+		t.Fatalf("deleted root should not leave status errors, got %+v", status)
+	}
+	if len(status.TrackedRoots) != 1 || status.TrackedRoots[0].State != protocol.RootStateRemoved {
+		t.Fatalf("expected removed root status, got %+v", status.TrackedRoots)
+	}
+	bootstrap, err := d.conn.Bootstrap(context.Background())
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if len(bootstrap.Roots) != 0 {
+		t.Fatalf("expected server root_remove to remove active roots, got %+v", bootstrap.Roots)
+	}
+}
+
 func TestIntegrationServerStoresNoPlaintextContentOrPaths(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -25,6 +27,9 @@ import (
 func TestRootRendersWelcomePage(t *testing.T) {
 	api, _ := newAPITestHarness(t)
 	api.cfg.PublicBaseURL = "https://syna.example.com/"
+	if err := api.db.AddTransferredBytes(3_000_000); err != nil {
+		t.Fatalf("AddTransferredBytes: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -45,6 +50,8 @@ func TestRootRendersWelcomePage(t *testing.T) {
 		`syna add "$HOME/Documents"`,
 		`data-copy="syna connect https://syna.example.com"`,
 		"/readyz",
+		"3.00 MB",
+		"transferred to devices",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body does not contain %q", want)
@@ -52,6 +59,40 @@ func TestRootRendersWelcomePage(t *testing.T) {
 	}
 	if strings.Contains(body, "/healthz") {
 		t.Fatal("body contains /healthz")
+	}
+}
+
+func TestObjectDownloadIncrementsTransferredBytes(t *testing.T) {
+	api, token := newAPITestHarness(t)
+	body := []byte("encrypted object bytes")
+	sum := sha256.Sum256(body)
+	objectID := hex.EncodeToString(sum[:])
+	if created, err := api.store.Put(api.db.SQL, objectID, "file_chunk", int64(len(body)), int64(len(body)), bytes.NewReader(body)); err != nil {
+		t.Fatalf("store.Put: %v", err)
+	} else if !created {
+		t.Fatal("expected object to be created")
+	}
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/objects/"+objectID, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(protocol.VersionHeader, "1")
+		rec := httptest.NewRecorder()
+		api.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("download %d status = %d want %d body=%s", i, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if !bytes.Equal(rec.Body.Bytes(), body) {
+			t.Fatalf("download %d body mismatch", i)
+		}
+	}
+
+	got, err := api.db.TransferredBytes()
+	if err != nil {
+		t.Fatalf("TransferredBytes: %v", err)
+	}
+	if want := int64(len(body) * 2); got != want {
+		t.Fatalf("transferred bytes = %d want %d", got, want)
 	}
 }
 

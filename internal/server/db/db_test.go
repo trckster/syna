@@ -45,6 +45,34 @@ func TestRootRemoveRecomputesRetainedFloor(t *testing.T) {
 	}
 }
 
+func TestTransferredBytesMetricAccumulates(t *testing.T) {
+	database := openTestDB(t)
+
+	got, err := database.TransferredBytes()
+	if err != nil {
+		t.Fatalf("TransferredBytes(initial): %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("initial transferred bytes = %d want 0", got)
+	}
+	if err := database.AddTransferredBytes(100); err != nil {
+		t.Fatalf("AddTransferredBytes(100): %v", err)
+	}
+	if err := database.AddTransferredBytes(23); err != nil {
+		t.Fatalf("AddTransferredBytes(23): %v", err)
+	}
+	if err := database.AddTransferredBytes(0); err != nil {
+		t.Fatalf("AddTransferredBytes(0): %v", err)
+	}
+	got, err = database.TransferredBytes()
+	if err != nil {
+		t.Fatalf("TransferredBytes(final): %v", err)
+	}
+	if got != 123 {
+		t.Fatalf("transferred bytes = %d want 123", got)
+	}
+}
+
 func TestSnapshotRefsAndPrune(t *testing.T) {
 	database := openTestDB(t)
 	sess := testSession()

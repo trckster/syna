@@ -1,13 +1,15 @@
 package api
 
 import (
+	"fmt"
 	"html/template"
 	"net/http"
 	"strings"
 )
 
 type rootPageData struct {
-	ServerURL string
+	ServerURL       string
+	TransferredText string
 }
 
 var rootPageTemplate = template.Must(template.New("root").Parse(`<!doctype html>
@@ -90,6 +92,12 @@ h1 {
 	line-height: 0.9;
 	letter-spacing: 0;
 }
+.hero-copy {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) max-content;
+	gap: 30px;
+	align-items: end;
+}
 .lede {
 	margin: 24px 0 0;
 	max-width: 610px;
@@ -114,6 +122,29 @@ h1 {
 .pill:hover {
 	color: var(--text);
 	border-color: #555;
+}
+.transfer {
+	justify-self: end;
+	padding-bottom: 7px;
+	text-align: right;
+}
+.transfer strong {
+	display: block;
+	color: #76f2a7;
+	font-size: clamp(28px, 4vw, 44px);
+	font-weight: 800;
+	line-height: 1.1;
+	white-space: nowrap;
+	text-shadow: 0 0 22px rgb(118 242 167 / 0.16);
+}
+.transfer span {
+	display: block;
+	margin-top: 6px;
+	color: var(--muted);
+	font-size: 13px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
 }
 .steps {
 	padding: 28px;
@@ -211,12 +242,21 @@ h1 {
 		min-height: auto;
 		padding: 28px;
 	}
-	.lede {
-		font-size: 18px;
-	}
-	.steps {
-		padding: 22px;
-	}
+		.lede {
+			font-size: 18px;
+		}
+		.hero-copy {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 22px;
+		}
+		.transfer {
+			justify-self: start;
+			padding-bottom: 0;
+			text-align: left;
+		}
+		.steps {
+			padding: 22px;
+		}
 	.command {
 		grid-template-columns: minmax(0, 1fr);
 	}
@@ -236,8 +276,16 @@ h1 {
 			<div>
 				<div class="mark" aria-hidden="true">S</div>
 				<p class="eyebrow">Server online</p>
-				<h1 id="title">Syna</h1>
-				<p class="lede">Private folder sync for your Linux devices. This server relays encrypted metadata and object blobs; your workspace key stays on your clients.</p>
+				<div class="hero-copy">
+					<div>
+						<h1 id="title">Syna</h1>
+						<p class="lede">Private folder sync for your Linux devices. This server relays encrypted metadata and object blobs; your workspace key stays on your clients.</p>
+					</div>
+					<div class="transfer" aria-label="Server transfer statistics">
+						<strong>{{.TransferredText}}</strong>
+						<span>transferred to devices</span>
+					</div>
+				</div>
 			</div>
 			<nav class="meta" aria-label="Server links">
 				<a class="pill" href="/readyz">Readiness</a>
@@ -348,7 +396,14 @@ func (a *API) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		return
 	}
-	if err := rootPageTemplate.Execute(w, rootPageData{ServerURL: a.rootServerURL(r)}); err != nil && a.logger != nil {
+	transferred, err := a.db.TransferredBytes()
+	if err != nil && a.logger != nil {
+		a.logger.Printf("load transferred bytes: %v", err)
+	}
+	if err := rootPageTemplate.Execute(w, rootPageData{
+		ServerURL:       a.rootServerURL(r),
+		TransferredText: formatTransferredMB(transferred),
+	}); err != nil && a.logger != nil {
 		a.logger.Printf("render root page: %v", err)
 	}
 }
@@ -366,4 +421,11 @@ func (a *API) rootServerURL(r *http.Request) string {
 		return "https://your-syna-server.example"
 	}
 	return scheme + "://" + r.Host
+}
+
+func formatTransferredMB(bytes int64) string {
+	if bytes < 0 {
+		bytes = 0
+	}
+	return fmt.Sprintf("%.2f MB", float64(bytes)/1_000_000)
 }

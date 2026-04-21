@@ -26,6 +26,11 @@ func Stats(database *db.DB) error {
 	for _, key := range []string{"workspaces", "devices", "roots", "events", "objects", "sessions"} {
 		fmt.Printf("%s: %d\n", key, counts[key])
 	}
+	transferredBytes, err := database.TransferredBytes()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("transferred_bytes: %d\n", transferredBytes)
 	return nil
 }
 

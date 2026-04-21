@@ -520,6 +520,30 @@ func (db *DB) QueueRootRescan(rootID string, createdAt time.Time) error {
 	}
 }
 
+func (db *DB) QueueRootRemove(rootID string, createdAt time.Time) error {
+	var existing string
+	err := db.SQL.QueryRow(`
+		SELECT op_id
+		FROM pending_ops
+		WHERE root_id = ? AND rel_path = '' AND op_type = 'root_remove'
+		ORDER BY created_at ASC
+		LIMIT 1
+	`, rootID).Scan(&existing)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = db.SQL.Exec(`
+			INSERT INTO pending_ops (op_id, root_id, rel_path, op_type, base_seq, payload_json, status, retry_count, last_error, next_retry_at, created_at)
+			VALUES (?, ?, '', 'root_remove', 0, '{}', 'queued', 0, NULL, NULL, ?)
+		`, pendingOpID(rootID, createdAt), rootID, createdAt)
+		return err
+	case err != nil:
+		return err
+	default:
+		_, err = db.SQL.Exec(`UPDATE pending_ops SET status = 'queued', next_retry_at = NULL WHERE op_id = ?`, existing)
+		return err
+	}
+}
+
 func (db *DB) DeletePendingOp(opID string) error {
 	_, err := db.SQL.Exec(`DELETE FROM pending_ops WHERE op_id = ?`, opID)
 	return err
