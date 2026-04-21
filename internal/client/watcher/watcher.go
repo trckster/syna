@@ -20,7 +20,7 @@ type Manager struct {
 	onChange func(Change)
 	mu       sync.Mutex
 	rootDirs map[string]string
-	dirRoots map[string]string
+	dirRoots map[string]map[string]struct{}
 }
 
 func New(onChange func(Change)) (*Manager, error) {
@@ -32,7 +32,7 @@ func New(onChange func(Change)) (*Manager, error) {
 		watcher:  w,
 		onChange: onChange,
 		rootDirs: make(map[string]string),
-		dirRoots: make(map[string]string),
+		dirRoots: make(map[string]map[string]struct{}),
 	}
 	go m.loop()
 	return m, nil
@@ -43,21 +43,27 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) AddRoot(rootID, absPath string) error {
-	m.mu.Lock()
-	m.rootDirs[rootID] = absPath
-	m.mu.Unlock()
+	absPath = filepath.Clean(absPath)
 	info, err := os.Stat(absPath)
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
+	m.rootDirs[rootID] = absPath
+	m.mu.Unlock()
 	if !info.IsDir() {
 		parent := filepath.Dir(absPath)
 		if err := m.addDir(rootID, parent); err != nil {
+			m.RemoveRoot(rootID)
 			return err
 		}
 		return nil
 	}
-	return m.addDirTree(rootID, absPath)
+	if err := m.addDirTree(rootID, absPath); err != nil {
+		m.RemoveRoot(rootID)
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) addDirTree(rootID, absPath string) error {
@@ -76,8 +82,14 @@ func (m *Manager) addDirTree(rootID, absPath string) error {
 }
 
 func (m *Manager) addDir(rootID, dir string) error {
+	dir = filepath.Clean(dir)
 	m.mu.Lock()
-	if currentRootID, ok := m.dirRoots[dir]; ok && currentRootID == rootID {
+	if roots := m.dirRoots[dir]; roots != nil {
+		if _, ok := roots[rootID]; ok {
+			m.mu.Unlock()
+			return nil
+		}
+		roots[rootID] = struct{}{}
 		m.mu.Unlock()
 		return nil
 	}
@@ -88,7 +100,10 @@ func (m *Manager) addDir(rootID, dir string) error {
 		}
 	}
 	m.mu.Lock()
-	m.dirRoots[dir] = rootID
+	if m.dirRoots[dir] == nil {
+		m.dirRoots[dir] = make(map[string]struct{})
+	}
+	m.dirRoots[dir][rootID] = struct{}{}
 	m.mu.Unlock()
 	return nil
 }
@@ -97,10 +112,13 @@ func (m *Manager) RemoveRoot(rootID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.rootDirs, rootID)
-	for dir, currentRootID := range m.dirRoots {
-		if currentRootID == rootID {
-			_ = m.watcher.Remove(dir)
-			delete(m.dirRoots, dir)
+	for dir, roots := range m.dirRoots {
+		if _, ok := roots[rootID]; ok {
+			delete(roots, rootID)
+			if len(roots) == 0 {
+				_ = m.watcher.Remove(dir)
+				delete(m.dirRoots, dir)
+			}
 		}
 	}
 }
@@ -112,21 +130,23 @@ func (m *Manager) loop() {
 			if !ok {
 				return
 			}
-			rootID := m.rootForEvent(ev.Name)
-			if rootID != "" && ev.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Write) != 0 {
+			rootIDs := m.rootsForEvent(ev.Name)
+			if len(rootIDs) > 0 && ev.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Write) != 0 {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-					_ = m.addDirTree(rootID, ev.Name)
+					for _, rootID := range rootIDs {
+						_ = m.addDirTree(rootID, ev.Name)
+					}
 				}
 			}
-			hint := ""
-			if rootID != "" {
-				hint = m.relHint(rootID, ev.Name)
+			var changes []Change
+			for _, rootID := range rootIDs {
+				changes = append(changes, Change{RootID: rootID, RelPathHint: m.relHint(rootID, ev.Name)})
 			}
-			if rootID == "" && ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-				rootID, hint = m.rootForMissingPath(ev.Name)
+			if len(changes) == 0 && ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				changes = m.changesForMissingPath(ev.Name)
 			}
-			if rootID != "" {
-				m.onChange(Change{RootID: rootID, RelPathHint: hint})
+			for _, change := range changes {
+				m.onChange(change)
 			}
 		case _, ok := <-m.watcher.Errors:
 			if !ok {
@@ -136,48 +156,57 @@ func (m *Manager) loop() {
 	}
 }
 
-func (m *Manager) rootForEvent(path string) string {
+func (m *Manager) rootsForEvent(path string) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.rootsForEventLocked(path)
+}
+
+func (m *Manager) rootsForEventLocked(path string) []string {
+	path = filepath.Clean(path)
 	current := path
 	for {
-		if rootID := m.dirRoots[current]; rootID != "" {
-			if m.pathMatchesRootLocked(rootID, path) {
-				return rootID
+		if candidates := m.dirRoots[current]; len(candidates) > 0 {
+			var roots []string
+			for rootID := range candidates {
+				if m.pathMatchesRootLocked(rootID, path) {
+					roots = append(roots, rootID)
+				}
 			}
-			return ""
+			return roots
 		}
 		next := filepath.Dir(current)
 		if next == current {
-			return ""
+			return nil
 		}
 		current = next
 	}
 }
 
-func (m *Manager) rootForMissingPath(path string) (string, string) {
+func (m *Manager) changesForMissingPath(path string) []Change {
 	current := filepath.Dir(path)
 	for {
 		if current == "." || current == "/" || current == "" {
-			rootID := m.rootForEvent(filepath.Dir(path))
-			if rootID == "" {
-				return "", ""
-			}
-			return rootID, m.nearestExistingAncestorHint(rootID, path)
+			return m.changesForExistingAncestor(filepath.Dir(path), path)
 		}
 		if _, err := os.Stat(current); err == nil {
-			rootID := m.rootForEvent(current)
-			if rootID == "" {
-				return "", ""
-			}
-			return rootID, m.nearestExistingAncestorHint(rootID, path)
+			return m.changesForExistingAncestor(current, path)
 		}
 		next := filepath.Dir(current)
 		if next == current {
-			return "", ""
+			return nil
 		}
 		current = next
 	}
+}
+
+func (m *Manager) changesForExistingAncestor(ancestor, path string) []Change {
+	rootIDs := m.rootsForEvent(ancestor)
+	changes := make([]Change, 0, len(rootIDs))
+	for _, rootID := range rootIDs {
+		changes = append(changes, Change{RootID: rootID, RelPathHint: m.nearestExistingAncestorHint(rootID, path)})
+	}
+	return changes
 }
 
 func (m *Manager) relHint(rootID, path string) string {

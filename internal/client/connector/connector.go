@@ -105,8 +105,7 @@ func (c *Client) UploadObject(ctx context.Context, objectID, kind string, plainS
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("upload object: %s", string(body))
+		return responseError("upload object", resp)
 	}
 	return nil
 }
@@ -135,8 +134,7 @@ func (c *Client) DownloadObjectTo(ctx context.Context, objectID string, maxBytes
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return 0, fmt.Errorf("download object: %s", string(body))
+		return 0, responseError("download object", resp)
 	}
 	if resp.ContentLength > maxBytes {
 		return 0, fmt.Errorf("object exceeds %d bytes", maxBytes)
@@ -162,6 +160,8 @@ func (c *Client) DialWS(ctx context.Context) (*websocket.Conn, error) {
 		u.Scheme = "ws"
 	case "https":
 		u.Scheme = "wss"
+	default:
+		return nil, fmt.Errorf("unsupported websocket URL scheme %q", u.Scheme)
 	}
 	u.Path = "/v1/ws"
 	header := http.Header{}
@@ -203,9 +203,12 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		if apiErr != nil {
-			_ = json.NewDecoder(resp.Body).Decode(apiErr)
+			_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(apiErr)
 			if apiErr.Message != "" {
 				return fmt.Errorf("%s", apiErr.Message)
+			}
+			if apiErr.Code == "" {
+				return fmt.Errorf("http %d", resp.StatusCode)
 			}
 			return fmt.Errorf("%s", apiErr.Code)
 		}
@@ -215,4 +218,13 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 		return json.NewDecoder(resp.Body).Decode(respBody)
 	}
 	return nil
+}
+
+func responseError(operation string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		return fmt.Errorf("%s: http %d", operation, resp.StatusCode)
+	}
+	return fmt.Errorf("%s: http %d: %s", operation, resp.StatusCode, message)
 }

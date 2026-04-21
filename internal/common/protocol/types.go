@@ -239,17 +239,6 @@ type RootStatus struct {
 	State         RootState `json:"state"`
 }
 
-type RPCRequest struct {
-	Method string `json:"method"`
-	Body   any    `json:"body,omitempty"`
-}
-
-type RPCResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
-	Body  any    `json:"body,omitempty"`
-}
-
 type WSMessage struct {
 	Type       string       `json:"type"`
 	Event      *EventRecord `json:"event,omitempty"`

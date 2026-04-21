@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"syna/internal/common/protocol"
@@ -14,6 +15,33 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestDialWSRejectsUnsupportedScheme(t *testing.T) {
+	client := New("ftp://example.test")
+	_, err := client.DialWS(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unsupported websocket URL scheme") {
+		t.Fatalf("expected unsupported scheme error, got %v", err)
+	}
+}
+
+func TestJSONErrorFallsBackToHTTPStatus(t *testing.T) {
+	client := &Client{
+		BaseURL: "https://example.test",
+		HTTPClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader("not json")),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	err := client.doJSON(context.Background(), http.MethodGet, "/v1/bootstrap", nil, nil)
+	if err == nil || err.Error() != "http 502" {
+		t.Fatalf("error = %v want http 502", err)
+	}
 }
 
 func TestDownloadObjectToRejectsOversizedBody(t *testing.T) {

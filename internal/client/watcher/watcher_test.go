@@ -64,6 +64,36 @@ func TestManagerReportsCommonFileEvents(t *testing.T) {
 	})
 }
 
+func TestManagerSupportsFileRootsSharingParent(t *testing.T) {
+	parent := t.TempDir()
+	first := filepath.Join(parent, "first.txt")
+	second := filepath.Join(parent, "second.txt")
+	mustWriteWatcherFile(t, first, "first")
+	mustWriteWatcherFile(t, second, "second")
+
+	changes := make(chan Change, 32)
+	m, err := New(func(change Change) {
+		changes <- change
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.Close()
+	if err := m.AddRoot("root-first", first); err != nil {
+		t.Fatalf("AddRoot(first): %v", err)
+	}
+	if err := m.AddRoot("root-second", second); err != nil {
+		t.Fatalf("AddRoot(second): %v", err)
+	}
+
+	mustWriteWatcherFile(t, first, "first updated")
+	waitForRootChange(t, changes, "root-first", "")
+
+	m.RemoveRoot("root-first")
+	mustWriteWatcherFile(t, second, "second updated")
+	waitForRootChange(t, changes, "root-second", "")
+}
+
 func mustWriteWatcherFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -77,6 +107,21 @@ func mustWriteWatcherFile(t *testing.T, path, content string) {
 func waitForChange(t *testing.T, changes <-chan Change, wantHint string) {
 	t.Helper()
 	waitForAnyChange(t, changes, map[string]bool{wantHint: true})
+}
+
+func waitForRootChange(t *testing.T, changes <-chan Change, wantRootID, wantHint string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case change := <-changes:
+			if change.RootID == wantRootID && change.RelPathHint == wantHint {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for root %q hint %q", wantRootID, wantHint)
+		}
+	}
 }
 
 func waitForAnyChange(t *testing.T, changes <-chan Change, wantHints map[string]bool) {

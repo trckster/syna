@@ -6,7 +6,6 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -80,12 +79,6 @@ func CheckOverlap(candidate string, existing []string) error {
 		}
 	}
 	return nil
-}
-
-func SortStoredRoots(roots []string) {
-	sort.Slice(roots, func(i, j int) bool {
-		return cleanStored(roots[i]) < cleanStored(roots[j])
-	})
 }
 
 func TargetForHomeRel(homeRel string) (string, error) {

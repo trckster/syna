@@ -260,6 +260,28 @@ func TestAPIRejectsInvalidEventAndObjectRequests(t *testing.T) {
 	}
 }
 
+func TestEventFetchRejectsMalformedQuery(t *testing.T) {
+	api, token := newAPITestHarness(t)
+	for _, target := range []string{
+		"/v1/events?after_seq=bad",
+		"/v1/events?after_seq=-1",
+		"/v1/events?limit=bad",
+		"/v1/events?limit=0",
+	} {
+		t.Run(target, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set(protocol.VersionHeader, "1")
+			rec := httptest.NewRecorder()
+
+			api.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestSessionStartRejectsMalformedWorkspacePublicKey(t *testing.T) {
 	api, _ := newAPITestHarness(t)
 	nonce := bytes.Repeat([]byte{0x11}, 32)

@@ -94,7 +94,8 @@ func saveJSONFile(path string, value any, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	if info, err := os.Lstat(path); err == nil {
@@ -104,10 +105,17 @@ func saveJSONFile(path string, value any, mode os.FileMode) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmpPath := file.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	if err := file.Chmod(mode); err != nil {
 		_ = file.Close()
 		return err
@@ -116,5 +124,16 @@ func saveJSONFile(path string, value any, mode os.FileMode) error {
 		_ = file.Close()
 		return err
 	}
-	return file.Close()
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	removeTmp = false
+	return os.Chmod(path, mode)
 }

@@ -1753,6 +1753,9 @@ func validateServerURL(serverURL string) error {
 	if err != nil {
 		return fmt.Errorf("parse server URL: %w", err)
 	}
+	if u.Host == "" {
+		return fmt.Errorf("server URL must include a host")
+	}
 	switch u.Scheme {
 	case "https":
 		return nil

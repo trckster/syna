@@ -98,6 +98,12 @@ func TestRootForRemoveReportsPathInsideTrackedRoot(t *testing.T) {
 	}
 }
 
+func TestValidateServerURLRequiresHost(t *testing.T) {
+	if err := validateServerURL("https:///missing-host"); err == nil || !strings.Contains(err.Error(), "must include a host") {
+		t.Fatalf("expected missing host rejection, got %v", err)
+	}
+}
+
 func TestRemoveRootRejectsWrongDirectoryWithoutChangingTrackedRoot(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "home")
 	setHome(t, home)

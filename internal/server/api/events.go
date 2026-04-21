@@ -21,10 +21,10 @@ func (a *API) handleEvents(w http.ResponseWriter, r *http.Request, sess *db.Sess
 }
 
 func (a *API) handleEventFetch(w http.ResponseWriter, r *http.Request, sess *db.Session) {
-	afterSeq, _ := strconv.ParseInt(r.URL.Query().Get("after_seq"), 10, 64)
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 || limit > a.cfg.MaxEventFetchPage {
-		limit = 100
+	afterSeq, limit, err := a.parseEventFetchQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_query", err.Error())
+		return
 	}
 	events, currentSeq, err := a.db.FetchEvents(sess.WorkspaceID, afterSeq, limit)
 	if err != nil {
@@ -43,6 +43,31 @@ func (a *API) handleEventFetch(w http.ResponseWriter, r *http.Request, sess *db.
 		Events:     events,
 		CurrentSeq: currentSeq,
 	})
+}
+
+func (a *API) parseEventFetchQuery(r *http.Request) (int64, int, error) {
+	query := r.URL.Query()
+	afterSeq := int64(0)
+	if rawAfterSeq := query.Get("after_seq"); rawAfterSeq != "" {
+		parsed, err := strconv.ParseInt(rawAfterSeq, 10, 64)
+		if err != nil || parsed < 0 {
+			return 0, 0, errors.New("after_seq must be a non-negative integer")
+		}
+		afterSeq = parsed
+	}
+
+	limit := 100
+	if rawLimit := query.Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			return 0, 0, errors.New("limit must be a positive integer")
+		}
+		limit = parsed
+	}
+	if a.cfg.MaxEventFetchPage > 0 && limit > a.cfg.MaxEventFetchPage {
+		limit = a.cfg.MaxEventFetchPage
+	}
+	return afterSeq, limit, nil
 }
 
 func (a *API) handleEventSubmit(w http.ResponseWriter, r *http.Request, sess *db.Session) {
