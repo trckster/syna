@@ -23,7 +23,7 @@ func (a *API) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	}
 	var req protocol.SessionStartRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
 	if req.WorkspaceID == "" {
@@ -36,14 +36,14 @@ func (a *API) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	}
 	clientNonce, err := parseFixedBase64(req.ClientNonce, sessionNonceSize, "client_nonce")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_client_nonce", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_client_nonce", "invalid client_nonce")
 		return
 	}
 	var pubKey []byte
 	if req.WorkspacePubKey != "" {
 		pubKey, err = commoncrypto.ParseBase64Raw(req.WorkspacePubKey)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_workspace_pubkey", err.Error())
+			writeError(w, http.StatusBadRequest, "bad_workspace_pubkey", "invalid workspace_pubkey")
 			return
 		}
 		if len(pubKey) != ed25519.PublicKeySize {
@@ -66,31 +66,31 @@ func (a *API) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 			created, err = a.db.EnsureWorkspaceWithinLimit(req.WorkspaceID, pubKey, a.cfg.MaxWorkspaces)
 			if err != nil {
 				if errors.Is(err, db.ErrWorkspaceLimitReached) {
-					writeError(w, http.StatusForbidden, "workspace_limit_reached", err.Error())
+					writeError(w, http.StatusForbidden, "workspace_limit_reached", "workspace limit reached")
 					return
 				}
-				writeError(w, http.StatusBadRequest, "workspace_create_failed", err.Error())
+				a.writeLoggedError(w, http.StatusBadRequest, "workspace_create_failed", "workspace create failed", err)
 				return
 			}
 		} else {
-			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			a.writeLoggedError(w, http.StatusInternalServerError, "db_error", "database error", err)
 			return
 		}
 	} else {
 		created, err = a.db.EnsureWorkspace(req.WorkspaceID, pubKey)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "workspace_key_mismatch", err.Error())
+			writeError(w, http.StatusBadRequest, "workspace_key_mismatch", "workspace public key mismatch")
 			return
 		}
 	}
 
 	serverNonce := make([]byte, 32)
 	if _, err := rand.Read(serverNonce); err != nil {
-		writeError(w, http.StatusInternalServerError, "random_failed", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "random_failed", "random source failed", err)
 		return
 	}
 	if err := a.db.SaveChallenge(req.WorkspaceID, req.DeviceID, req.DeviceName, clientNonce, serverNonce); err != nil {
-		writeError(w, http.StatusInternalServerError, "challenge_save_failed", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "challenge_save_failed", "challenge save failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, protocol.SessionStartResponse{
@@ -109,7 +109,7 @@ func (a *API) handleSessionFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	var req protocol.SessionFinishRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
 	if req.WorkspaceID == "" {
@@ -122,7 +122,7 @@ func (a *API) handleSessionFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	clientNonce, err := parseFixedBase64(req.ClientNonce, sessionNonceSize, "client_nonce")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_client_nonce", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_client_nonce", "invalid client_nonce")
 		return
 	}
 	serverNonce, deviceName, expiresAt, err := a.db.LoadChallenge(req.WorkspaceID, req.DeviceID, clientNonce)
@@ -150,7 +150,7 @@ func (a *API) handleSessionFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	signature, err := parseFixedBase64(req.Signature, ed25519.SignatureSize, "signature")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_signature", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_signature", "invalid signature")
 		return
 	}
 	if !commoncrypto.VerifyTranscript(pubKey, req.WorkspaceID, req.DeviceID, clientNonce, serverNonce, signature) {
@@ -160,7 +160,7 @@ func (a *API) handleSessionFinish(w http.ResponseWriter, r *http.Request) {
 	_ = a.db.DeleteChallenge(req.WorkspaceID, req.DeviceID, clientNonce)
 	token, expires, currentSeq, err := a.db.CreateSession(req.WorkspaceID, req.DeviceID, deviceName, a.cfg.SessionTTL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "session_create_failed", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "session_create_failed", "session create failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, protocol.SessionFinishResponse{

@@ -26,8 +26,9 @@ In Coolify:
 5. In Network, set `Ports Exposes` to `8080` and leave `Port Mappings` empty.
 6. In Domains, set the HTTPS URL clients will use, for example
    `https://syna.example.com`.
-7. In Environment Variables, add `SYNA_MAX_WORKSPACES=1` to allow only one
-   workspace key; leave it unset or set `0` for the default unlimited threshold.
+7. Leave `SYNA_MAX_WORKSPACES=10` for the default hosted limit, or set a
+   different finite value. Use `0` only if this server should allow unlimited
+   workspace creation.
 8. In Persistent Storage, add a Docker volume:
    - Name: `syna-data`
    - Source Path: leave empty

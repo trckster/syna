@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"syna/internal/common/protocol"
 	servercfg "syna/internal/server/config"
 	"syna/internal/server/db"
@@ -67,6 +69,27 @@ func TestRootRendersWelcomePage(t *testing.T) {
 	}
 }
 
+func TestReadyzDoesNotExposeDatabaseError(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+	if err := api.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d want %d body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "sql:") || strings.Contains(body, "database is closed") {
+		t.Fatalf("readyz leaked internal database error: %s", body)
+	}
+	if !strings.Contains(body, "db_unavailable") {
+		t.Fatalf("readyz body missing public error code: %s", body)
+	}
+}
+
 func TestObjectDownloadIncrementsTransferredBytes(t *testing.T) {
 	api, token := newAPITestHarness(t)
 	body := []byte("encrypted object bytes")
@@ -76,6 +99,9 @@ func TestObjectDownloadIncrementsTransferredBytes(t *testing.T) {
 		t.Fatalf("store.Put: %v", err)
 	} else if !created {
 		t.Fatal("expected object to be created")
+	}
+	if err := api.db.AssociateObjectWithWorkspace("workspace-1", objectID); err != nil {
+		t.Fatalf("AssociateObjectWithWorkspace: %v", err)
 	}
 
 	for i := 0; i < 2; i++ {
@@ -98,6 +124,50 @@ func TestObjectDownloadIncrementsTransferredBytes(t *testing.T) {
 	}
 	if want := int64(len(body) * 2); got != want {
 		t.Fatalf("transferred bytes = %d want %d", got, want)
+	}
+}
+
+func TestObjectDownloadRequiresWorkspaceAccess(t *testing.T) {
+	api, tokenA := newAPITestHarness(t)
+	tokenB := createAPIWorkspaceSession(t, api, "workspace-2", "device-2")
+	body := []byte("workspace-a-ciphertext")
+	objectID := uploadObjectViaAPI(t, api, tokenA, "file_chunk", body)
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{name: "missing auth", want: http.StatusUnauthorized},
+		{name: "own workspace", token: tokenA, want: http.StatusOK},
+		{name: "other workspace", token: tokenB, want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/objects/"+objectID, nil)
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			req.Header.Set(protocol.VersionHeader, "1")
+			rec := httptest.NewRecorder()
+
+			api.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d want %d body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.want == http.StatusOK && !bytes.Equal(rec.Body.Bytes(), body) {
+				t.Fatalf("download body mismatch")
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/objects/0000000000000000000000000000000000000000000000000000000000000000", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenA)
+	req.Header.Set(protocol.VersionHeader, "1")
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown object status = %d want %d body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
 	}
 }
 
@@ -191,6 +261,92 @@ func TestAPIRejectsUnauthenticatedAndBadProtocolRequests(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("status = %d want %d", rec.Code, http.StatusUnauthorized)
 			}
+			if strings.Contains(rec.Body.String(), "sql:") || strings.Contains(rec.Body.String(), "no rows") {
+				t.Fatalf("unauthorized response leaked internal auth error: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPIAuthorizationBoundaries(t *testing.T) {
+	api, token := newAPITestHarness(t)
+	objectID := strings.Repeat("0", 64)
+
+	cases := []struct {
+		name           string
+		method         string
+		path           string
+		body           []byte
+		token          string
+		wantStatus     int
+		requiresAuth   bool
+		protocolHeader bool
+	}{
+		{name: "root public", method: http.MethodGet, path: "/", wantStatus: http.StatusOK},
+		{name: "health public", method: http.MethodGet, path: "/healthz", wantStatus: http.StatusOK},
+		{name: "ready public", method: http.MethodGet, path: "/readyz", wantStatus: http.StatusOK},
+		{name: "session start public", method: http.MethodPost, path: "/v1/session/start", body: []byte(`{}`), wantStatus: http.StatusBadRequest},
+		{name: "session finish public", method: http.MethodPost, path: "/v1/session/finish", body: []byte(`{}`), wantStatus: http.StatusBadRequest},
+		{name: "bootstrap requires auth", method: http.MethodGet, path: "/v1/bootstrap", requiresAuth: true},
+		{name: "event fetch requires auth", method: http.MethodGet, path: "/v1/events?after_seq=0", requiresAuth: true},
+		{name: "event submit requires auth", method: http.MethodPost, path: "/v1/events", body: []byte(`{}`), requiresAuth: true},
+		{name: "snapshot submit requires auth", method: http.MethodPost, path: "/v1/snapshots", body: []byte(`{}`), requiresAuth: true},
+		{name: "object upload requires auth", method: http.MethodPut, path: "/v1/objects/" + objectID, body: []byte("body"), requiresAuth: true},
+		{name: "object download requires auth", method: http.MethodGet, path: "/v1/objects/" + objectID, requiresAuth: true},
+		{name: "websocket requires auth", method: http.MethodGet, path: "/v1/ws", requiresAuth: true},
+		{name: "bootstrap accepts auth", method: http.MethodGet, path: "/v1/bootstrap", token: token, protocolHeader: true, wantStatus: http.StatusOK},
+		{name: "event fetch accepts auth", method: http.MethodGet, path: "/v1/events?after_seq=0", token: token, protocolHeader: true, wantStatus: http.StatusOK},
+		{name: "snapshot submit reaches handler with auth", method: http.MethodPost, path: "/v1/snapshots", body: []byte(`{}`), token: token, protocolHeader: true, wantStatus: http.StatusBadRequest},
+		{name: "object download reaches handler with auth", method: http.MethodGet, path: "/v1/objects/" + objectID, token: token, protocolHeader: true, wantStatus: http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader(tc.body))
+			if tc.protocolHeader || tc.requiresAuth {
+				req.Header.Set(protocol.VersionHeader, "1")
+			}
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			rec := httptest.NewRecorder()
+
+			api.Handler().ServeHTTP(rec, req)
+			want := tc.wantStatus
+			if tc.requiresAuth {
+				want = http.StatusUnauthorized
+			}
+			if rec.Code != want {
+				t.Fatalf("status = %d want %d body=%s", rec.Code, want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestWebsocketOriginPolicy(t *testing.T) {
+	api, _ := newAPITestHarness(t)
+	cases := []struct {
+		name      string
+		publicURL string
+		origin    string
+		want      bool
+	}{
+		{name: "unset public url allows browser origin", origin: "https://app.example.com", want: true},
+		{name: "empty origin is allowed", publicURL: "https://syna.example.com", want: true},
+		{name: "matching origin is allowed", publicURL: "https://syna.example.com/path", origin: "https://syna.example.com", want: true},
+		{name: "different host is rejected", publicURL: "https://syna.example.com", origin: "https://evil.example.com", want: false},
+		{name: "different scheme is rejected", publicURL: "https://syna.example.com", origin: "http://syna.example.com", want: false},
+		{name: "invalid origin is rejected", publicURL: "https://syna.example.com", origin: "://bad", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api.cfg.PublicBaseURL = tc.publicURL
+			req := httptest.NewRequest(http.MethodGet, "/v1/ws", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if got := api.checkWSOrigin(req); got != tc.want {
+				t.Fatalf("checkWSOrigin = %v want %v", got, tc.want)
+			}
 		})
 	}
 }
@@ -279,6 +435,147 @@ func TestEventFetchRejectsMalformedQuery(t *testing.T) {
 				t.Fatalf("status = %d want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestEventSubmitRejectsObjectRefsOutsideWorkspace(t *testing.T) {
+	api, tokenA := newAPITestHarness(t)
+	tokenB := createAPIWorkspaceSession(t, api, "workspace-2", "device-2")
+	objectID := uploadObjectViaAPI(t, api, tokenA, "file_chunk", []byte("workspace-a-event-object"))
+
+	assertEventStatus(t, api, tokenB, protocol.EventSubmitRequest{
+		RootID:      "root-b",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+		ObjectRefs:  []string{objectID},
+	}, http.StatusBadRequest)
+
+	assertEventStatus(t, api, tokenA, protocol.EventSubmitRequest{
+		RootID:      "root-a",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+		ObjectRefs:  []string{objectID},
+	}, http.StatusOK)
+}
+
+func TestSnapshotSubmitRejectsObjectsOutsideWorkspace(t *testing.T) {
+	api, tokenA := newAPITestHarness(t)
+	tokenB := createAPIWorkspaceSession(t, api, "workspace-2", "device-2")
+	snapshotA := uploadObjectViaAPI(t, api, tokenA, "snapshot", []byte("workspace-a-snapshot-object"))
+	chunkA := uploadObjectViaAPI(t, api, tokenA, "file_chunk", []byte("workspace-a-snapshot-ref"))
+	snapshotB := uploadObjectViaAPI(t, api, tokenB, "snapshot", []byte("workspace-b-snapshot-object"))
+
+	assertEventStatus(t, api, tokenB, protocol.EventSubmitRequest{
+		RootID:      "root-b",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+	}, http.StatusOK)
+
+	assertSnapshotStatus(t, api, tokenB, protocol.SnapshotSubmitRequest{
+		RootID:   "root-b",
+		BaseSeq:  1,
+		ObjectID: snapshotA,
+	}, http.StatusBadRequest)
+
+	assertSnapshotStatus(t, api, tokenB, protocol.SnapshotSubmitRequest{
+		RootID:     "root-b",
+		BaseSeq:    1,
+		ObjectID:   snapshotB,
+		ObjectRefs: []string{chunkA},
+	}, http.StatusBadRequest)
+}
+
+func TestBootstrapAndEventFetchUseSessionWorkspace(t *testing.T) {
+	api, tokenA := newAPITestHarness(t)
+	tokenB := createAPIWorkspaceSession(t, api, "workspace-2", "device-2")
+
+	assertEventStatus(t, api, tokenA, protocol.EventSubmitRequest{
+		RootID:      "root-a",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-a",
+	}, http.StatusOK)
+	assertEventStatus(t, api, tokenB, protocol.EventSubmitRequest{
+		RootID:      "root-b",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-b",
+	}, http.StatusOK)
+
+	bootstrapReq := httptest.NewRequest(http.MethodGet, "/v1/bootstrap", nil)
+	bootstrapReq.Header.Set("Authorization", "Bearer "+tokenB)
+	bootstrapReq.Header.Set(protocol.VersionHeader, "1")
+	bootstrapRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(bootstrapRec, bootstrapReq)
+	if bootstrapRec.Code != http.StatusOK {
+		t.Fatalf("bootstrap status = %d want %d body=%s", bootstrapRec.Code, http.StatusOK, bootstrapRec.Body.String())
+	}
+	var bootstrap protocol.BootstrapResponse
+	if err := json.Unmarshal(bootstrapRec.Body.Bytes(), &bootstrap); err != nil {
+		t.Fatalf("Unmarshal(bootstrap): %v", err)
+	}
+	if bootstrap.WorkspaceID != "workspace-2" || len(bootstrap.Roots) != 1 || bootstrap.Roots[0].RootID != "root-b" {
+		t.Fatalf("bootstrap leaked another workspace or missed own root: %+v", bootstrap)
+	}
+
+	eventsReq := httptest.NewRequest(http.MethodGet, "/v1/events?after_seq=0", nil)
+	eventsReq.Header.Set("Authorization", "Bearer "+tokenB)
+	eventsReq.Header.Set(protocol.VersionHeader, "1")
+	eventsRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(eventsRec, eventsReq)
+	if eventsRec.Code != http.StatusOK {
+		t.Fatalf("events status = %d want %d body=%s", eventsRec.Code, http.StatusOK, eventsRec.Body.String())
+	}
+	var events protocol.EventFetchResponse
+	if err := json.Unmarshal(eventsRec.Body.Bytes(), &events); err != nil {
+		t.Fatalf("Unmarshal(events): %v", err)
+	}
+	if len(events.Events) != 1 || events.Events[0].RootID != "root-b" {
+		t.Fatalf("event fetch leaked another workspace or missed own event: %+v", events.Events)
+	}
+}
+
+func TestWebsocketSubscribeUsesSessionWorkspace(t *testing.T) {
+	api, tokenA := newAPITestHarness(t)
+	tokenB := createAPIWorkspaceSession(t, api, "workspace-2", "device-2")
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	connB := dialAPIWebsocket(t, server.URL, tokenB)
+	defer connB.Close()
+	assertEventStatus(t, api, tokenB, protocol.EventSubmitRequest{
+		RootID:      "root-b",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-b",
+	}, http.StatusOK)
+	var msg protocol.WSMessage
+	if err := connB.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if err := connB.ReadJSON(&msg); err != nil {
+		t.Fatalf("ReadJSON(own workspace event): %v", err)
+	}
+	if msg.Event == nil || msg.Event.RootID != "root-b" {
+		t.Fatalf("websocket received wrong own-workspace message: %+v", msg)
+	}
+
+	connB2 := dialAPIWebsocket(t, server.URL, tokenB)
+	defer connB2.Close()
+	assertEventStatus(t, api, tokenA, protocol.EventSubmitRequest{
+		RootID:      "root-a",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-a",
+	}, http.StatusOK)
+	if err := connB2.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if err := connB2.ReadJSON(&msg); err == nil {
+		t.Fatalf("workspace-b websocket received workspace-a message: %+v", msg)
 	}
 }
 
@@ -475,6 +772,52 @@ func newAPITestHarness(t *testing.T) (*API, string) {
 	return New(cfg, database, objectstore.New(dataDir), hub.New(cfg.MaxWSClients, logger), logger), token
 }
 
+func createAPIWorkspaceSession(t *testing.T, api *API, workspaceID, deviceID string) string {
+	t.Helper()
+	if _, err := api.db.EnsureWorkspace(workspaceID, []byte("pubkey-"+workspaceID)); err != nil {
+		t.Fatalf("EnsureWorkspace(%s): %v", workspaceID, err)
+	}
+	token, _, _, err := api.db.CreateSession(workspaceID, deviceID, "device", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession(%s): %v", workspaceID, err)
+	}
+	return token
+}
+
+func uploadObjectViaAPI(t *testing.T, api *API, token, kind string, body []byte) string {
+	t.Helper()
+	sum := sha256.Sum256(body)
+	objectID := hex.EncodeToString(sum[:])
+	req := httptest.NewRequest(http.MethodPut, "/v1/objects/"+objectID, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set(protocol.VersionHeader, "1")
+	req.Header.Set("X-Syna-Object-Kind", kind)
+	req.Header.Set("X-Syna-Plain-Size", "1")
+	rec := httptest.NewRecorder()
+
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("upload object status = %d want 201/200 body=%s", rec.Code, rec.Body.String())
+	}
+	return objectID
+}
+
+func dialAPIWebsocket(t *testing.T, serverURL, token string) *websocket.Conn {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/v1/ws"
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+token)
+	header.Set(protocol.VersionHeader, "1")
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("websocket dial status = %d err=%v", resp.StatusCode, err)
+		}
+		t.Fatalf("websocket dial: %v", err)
+	}
+	return conn
+}
+
 func assertEventStatus(t *testing.T, api *API, token string, event protocol.EventSubmitRequest, want int) {
 	t.Helper()
 	body, err := json.Marshal(event)
@@ -489,6 +832,23 @@ func assertEventStatus(t *testing.T, api *API, token string, event protocol.Even
 	api.Handler().ServeHTTP(rec, req)
 	if rec.Code != want {
 		t.Fatalf("event %+v status = %d want %d body=%s", event, rec.Code, want, rec.Body.String())
+	}
+}
+
+func assertSnapshotStatus(t *testing.T, api *API, token string, snapshot protocol.SnapshotSubmitRequest, want int) {
+	t.Helper()
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("Marshal(snapshot): %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/snapshots", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set(protocol.VersionHeader, "1")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != want {
+		t.Fatalf("snapshot %+v status = %d want %d body=%s", snapshot, rec.Code, want, rec.Body.String())
 	}
 }
 

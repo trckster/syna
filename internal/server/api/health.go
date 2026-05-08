@@ -8,7 +8,7 @@ func (a *API) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if err := a.db.SQL.PingContext(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "db_unavailable", err.Error())
+		a.writeLoggedError(w, http.StatusServiceUnavailable, "db_unavailable", "database unavailable", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

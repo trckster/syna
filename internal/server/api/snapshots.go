@@ -15,11 +15,11 @@ func (a *API) handleSnapshotSubmit(w http.ResponseWriter, r *http.Request, sess 
 	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxSnapshotBody)
 	var req protocol.SnapshotSubmitRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
 	if err := a.db.SaveSnapshot(sess, req); err != nil {
-		writeError(w, http.StatusBadRequest, "snapshot_rejected", err.Error())
+		a.writeLoggedError(w, http.StatusBadRequest, "snapshot_rejected", "snapshot rejected", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, protocol.SnapshotSubmitResponse{

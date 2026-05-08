@@ -32,11 +32,11 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 	if removedSeq.Valid {
 		return fmt.Errorf("root removed")
 	}
-	if !objectExists(tx, req.ObjectID) {
+	if !objectVisibleToWorkspace(tx, sess.WorkspaceID, req.ObjectID) {
 		return fmt.Errorf("missing snapshot object")
 	}
 	for _, objectID := range req.ObjectRefs {
-		if !objectExists(tx, objectID) {
+		if !objectVisibleToWorkspace(tx, sess.WorkspaceID, objectID) {
 			return fmt.Errorf("missing snapshot object ref %s", objectID)
 		}
 	}
@@ -76,11 +76,4 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 		return err
 	}
 	return db.RecomputeRetainedFloor(sess.WorkspaceID)
-}
-
-func objectExists(q interface {
-	QueryRow(query string, args ...any) *sql.Row
-}, objectID string) bool {
-	var exists int
-	return q.QueryRow(`SELECT 1 FROM objects WHERE object_id = ?`, objectID).Scan(&exists) == nil
 }

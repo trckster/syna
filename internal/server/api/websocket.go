@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,10 +21,10 @@ const (
 func (a *API) handleWS(w http.ResponseWriter, r *http.Request) {
 	sess, err := a.sessionFromRequest(r)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		writeError(w, http.StatusUnauthorized, "unauthorized", "")
 		return
 	}
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{CheckOrigin: a.checkWSOrigin}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -77,4 +78,20 @@ func (a *API) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func (a *API) checkWSOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || a.cfg.PublicBaseURL == "" {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	publicURL, err := url.Parse(a.cfg.PublicBaseURL)
+	if err != nil {
+		return false
+	}
+	return originURL.Scheme == publicURL.Scheme && originURL.Host == publicURL.Host
 }

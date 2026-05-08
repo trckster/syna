@@ -32,8 +32,7 @@ func (db *DB) SubmitEvent(sess *Session, req protocol.EventSubmitRequest) (*Subm
 		return nil, err
 	}
 	for _, objectID := range req.ObjectRefs {
-		var exists int
-		if err := tx.QueryRow(`SELECT 1 FROM objects WHERE object_id = ?`, objectID).Scan(&exists); err != nil {
+		if !objectVisibleToWorkspace(tx, sess.WorkspaceID, objectID) {
 			return nil, fmt.Errorf("missing object ref %s", objectID)
 		}
 	}

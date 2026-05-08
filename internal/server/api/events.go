@@ -23,7 +23,7 @@ func (a *API) handleEvents(w http.ResponseWriter, r *http.Request, sess *db.Sess
 func (a *API) handleEventFetch(w http.ResponseWriter, r *http.Request, sess *db.Session) {
 	afterSeq, limit, err := a.parseEventFetchQuery(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_query", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_query", "invalid event query")
 		return
 	}
 	events, currentSeq, err := a.db.FetchEvents(sess.WorkspaceID, afterSeq, limit)
@@ -36,7 +36,7 @@ func (a *API) handleEventFetch(w http.ResponseWriter, r *http.Request, sess *db.
 			})
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "db_error", "database error", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, protocol.EventFetchResponse{
@@ -74,7 +74,7 @@ func (a *API) handleEventSubmit(w http.ResponseWriter, r *http.Request, sess *db
 	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxEventBodyBytes)
 	var req protocol.EventSubmitRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
 	result, err := a.db.SubmitEvent(sess, req)
@@ -87,7 +87,7 @@ func (a *API) handleEventSubmit(w http.ResponseWriter, r *http.Request, sess *db
 			})
 			return
 		}
-		writeError(w, http.StatusBadRequest, "event_rejected", err.Error())
+		a.writeLoggedError(w, http.StatusBadRequest, "event_rejected", "event rejected", err)
 		return
 	}
 	a.hub.Publish(sess.WorkspaceID, protocol.WSMessage{

@@ -15,15 +15,15 @@ func TestLoadParsesMaxWorkspaces(t *testing.T) {
 	}
 }
 
-func TestLoadDefaultsToUnlimitedWorkspaces(t *testing.T) {
+func TestLoadDefaultsToTenWorkspaces(t *testing.T) {
 	clearLoadEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MaxWorkspaces != 0 {
-		t.Fatalf("MaxWorkspaces = %d want 0", cfg.MaxWorkspaces)
+	if cfg.MaxWorkspaces != 10 {
+		t.Fatalf("MaxWorkspaces = %d want 10", cfg.MaxWorkspaces)
 	}
 }
 

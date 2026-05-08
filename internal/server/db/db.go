@@ -15,7 +15,7 @@ type DB struct {
 	SQL *sql.DB
 }
 
-const LatestSchemaVersion = 4
+const LatestSchemaVersion = 5
 
 type Session struct {
 	WorkspaceID string

@@ -26,3 +26,10 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 		Message: message,
 	})
 }
+
+func (a *API) writeLoggedError(w http.ResponseWriter, status int, code, message string, err error) {
+	if err != nil && a.logger != nil {
+		a.logger.Printf("%s: %v", code, err)
+	}
+	writeError(w, status, code, message)
+}

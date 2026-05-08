@@ -60,8 +60,9 @@ toggle is required when using Coolify's normal domain/proxy path.
 Required environment variables in Coolify:
 
 - `SYNA_PUBLIC_BASE_URL=$COOLIFY_URL`
-- Optional: `SYNA_MAX_WORKSPACES=1` allows only one workspace key; unset or `0`
-  keeps the default unlimited threshold.
+- Optional: `SYNA_MAX_WORKSPACES=10` keeps the default hosted workspace limit.
+  Set a different finite value if needed, or `0` only when unlimited workspace
+  creation is intended.
 
 Coolify's `Domains` field is the source of truth for the public URL. Keep the
 environment variable's `Literal` option disabled so Coolify expands
@@ -76,7 +77,7 @@ The image and application already default to:
 - `SYNA_SESSION_TTL=24h`
 - `SYNA_EVENT_RETENTION=24h`
 - `SYNA_ZERO_REF_RETENTION=168h`
-- `SYNA_MAX_WORKSPACES=0`
+- `SYNA_MAX_WORKSPACES=10`
 - `SYNA_READ_HEADER_TIMEOUT=10s`
 - `SYNA_READ_TIMEOUT=30s`
 - `SYNA_WRITE_TIMEOUT=30s`

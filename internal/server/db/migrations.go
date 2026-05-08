@@ -104,6 +104,14 @@ func (db *DB) Migrate() error {
 			created_at TIMESTAMP NOT NULL,
 			last_accessed_at TIMESTAMP NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS workspace_objects (
+			workspace_id TEXT NOT NULL,
+			object_id TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (workspace_id, object_id),
+			FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+			FOREIGN KEY (object_id) REFERENCES objects(object_id) ON DELETE CASCADE
+		);`,
 		`CREATE TABLE IF NOT EXISTS server_metrics (
 			key TEXT PRIMARY KEY,
 			value INTEGER NOT NULL
@@ -124,8 +132,48 @@ func (db *DB) Migrate() error {
 	if _, err := db.SQL.Exec(`CREATE TABLE IF NOT EXISTS server_metrics (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`); err != nil {
 		return err
 	}
+	if _, err := db.SQL.Exec(`
+		CREATE TABLE IF NOT EXISTS workspace_objects (
+			workspace_id TEXT NOT NULL,
+			object_id TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (workspace_id, object_id),
+			FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+			FOREIGN KEY (object_id) REFERENCES objects(object_id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		return err
+	}
+	if err := db.backfillWorkspaceObjects(); err != nil {
+		return err
+	}
 	if _, err := db.SQL.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)`, LatestSchemaVersion); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (db *DB) backfillWorkspaceObjects() error {
+	stmts := []string{
+		`INSERT OR IGNORE INTO workspace_objects (workspace_id, object_id, created_at)
+		SELECT DISTINCT e.workspace_id, r.object_id, o.created_at
+		FROM events e
+		JOIN event_object_refs r ON r.event_seq = e.seq
+		JOIN objects o ON o.object_id = r.object_id`,
+		`INSERT OR IGNORE INTO workspace_objects (workspace_id, object_id, created_at)
+		SELECT DISTINCT s.workspace_id, s.object_id, o.created_at
+		FROM snapshots s
+		JOIN objects o ON o.object_id = s.object_id`,
+		`INSERT OR IGNORE INTO workspace_objects (workspace_id, object_id, created_at)
+		SELECT DISTINCT s.workspace_id, r.object_id, o.created_at
+		FROM snapshots s
+		JOIN snapshot_object_refs r ON r.snapshot_object_id = s.object_id
+		JOIN objects o ON o.object_id = r.object_id`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.SQL.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }

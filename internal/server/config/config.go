@@ -47,10 +47,10 @@ func Load() (Config, error) {
 		MaxSnapshotBody:   protocol.MaxSnapshotPlainSize,
 		MaxSnapshotPlain:  protocol.MaxSnapshotPlainSize,
 		MaxWSClients:      32,
-		MaxWorkspaces:     0,
+		MaxWorkspaces:     10,
 	}
 	var err error
-	if cfg.MaxWorkspaces, err = parseNonNegativeInt("SYNA_MAX_WORKSPACES", env("SYNA_MAX_WORKSPACES", "0")); err != nil {
+	if cfg.MaxWorkspaces, err = parseNonNegativeInt("SYNA_MAX_WORKSPACES", env("SYNA_MAX_WORKSPACES", "10")); err != nil {
 		return Config{}, err
 	}
 	if cfg.SessionTTL, err = time.ParseDuration(env("SYNA_SESSION_TTL", "24h")); err != nil {
@@ -152,6 +152,9 @@ func (cfg Config) Warnings() []string {
 	}
 	if strings.HasPrefix(cfg.Listen, ":") || strings.HasPrefix(cfg.Listen, "0.0.0.0:") || strings.HasPrefix(cfg.Listen, "[::]:") {
 		warnings = append(warnings, "bind the backend to localhost or a private interface and expose it only through an HTTPS reverse proxy")
+	}
+	if cfg.MaxWorkspaces == 0 {
+		warnings = append(warnings, "SYNA_MAX_WORKSPACES=0 allows unlimited workspace creation; use a finite limit for public deployments")
 	}
 	return warnings
 }

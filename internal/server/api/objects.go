@@ -15,19 +15,24 @@ func (a *API) handleObjects(w http.ResponseWriter, r *http.Request) {
 	objectID := path.Base(r.URL.Path)
 	switch r.Method {
 	case http.MethodPut:
-		if _, err := a.sessionFromRequest(r); err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		sess, err := a.sessionFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "")
 			return
 		}
 		kind, plainSize, maxUploadBytes, err := a.validateObjectUpload(r)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "object_upload_failed", err.Error())
+			writeError(w, http.StatusBadRequest, "object_upload_failed", "invalid object upload")
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 		created, err := a.store.Put(a.db.SQL, objectID, kind, plainSize, maxUploadBytes, r.Body)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "object_upload_failed", err.Error())
+			a.writeLoggedError(w, http.StatusBadRequest, "object_upload_failed", "invalid object upload", err)
+			return
+		}
+		if err := a.db.AssociateObjectWithWorkspace(sess.WorkspaceID, objectID); err != nil {
+			a.writeLoggedError(w, http.StatusBadRequest, "object_upload_failed", "invalid object upload", err)
 			return
 		}
 		if created {
@@ -36,11 +41,16 @@ func (a *API) handleObjects(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}
 	case http.MethodGet:
-		if _, err := a.sessionFromRequest(r); err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+		sess, err := a.sessionFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "")
 			return
 		}
 		if !objectstore.ValidObjectID(objectID) {
+			writeError(w, http.StatusNotFound, "object_not_found", "")
+			return
+		}
+		if !a.db.ObjectVisibleToWorkspace(sess.WorkspaceID, objectID) {
 			writeError(w, http.StatusNotFound, "object_not_found", "")
 			return
 		}

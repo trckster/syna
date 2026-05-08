@@ -286,6 +286,40 @@ func TestSessionUsesChallengeDeviceName(t *testing.T) {
 	}
 }
 
+func TestSaveChallengePrunesExpiredChallenges(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+	now := time.Now().UTC()
+
+	for _, item := range []struct {
+		nonce     []byte
+		expiresAt time.Time
+	}{
+		{nonce: []byte("expired-nonce"), expiresAt: now.Add(-time.Minute)},
+		{nonce: []byte("active-nonce"), expiresAt: now.Add(time.Minute)},
+	} {
+		if _, err := database.SQL.Exec(`
+			INSERT INTO session_challenges
+			(workspace_id, device_id, client_nonce, server_nonce, device_name, expires_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, sess.WorkspaceID, sess.DeviceID, item.nonce, []byte("server-nonce"), "device", item.expiresAt, now); err != nil {
+			t.Fatalf("insert challenge: %v", err)
+		}
+	}
+
+	if err := database.SaveChallenge(sess.WorkspaceID, "device-2", "laptop", []byte("new-nonce"), []byte("new-server-nonce")); err != nil {
+		t.Fatalf("SaveChallenge: %v", err)
+	}
+
+	var count int
+	if err := database.SQL.QueryRow(`SELECT COUNT(*) FROM session_challenges`).Scan(&count); err != nil {
+		t.Fatalf("count challenges: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("challenge count = %d want 2", count)
+	}
+}
+
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
 	database, err := Open(filepath.Join(t.TempDir(), "state.db"))
@@ -305,12 +339,20 @@ func testSession() *Session {
 
 func insertObject(t *testing.T, database *DB, objectID string) {
 	t.Helper()
+	insertObjectForWorkspace(t, database, "workspace-1", objectID)
+}
+
+func insertObjectForWorkspace(t *testing.T, database *DB, workspaceID, objectID string) {
+	t.Helper()
 	now := time.Now().UTC().Add(-2 * time.Hour)
 	if _, err := database.SQL.Exec(`
 		INSERT INTO objects (object_id, kind, size_bytes, storage_rel_path, ref_count, zero_ref_at, created_at, last_accessed_at)
 		VALUES (?, 'file_chunk', 1, ?, 0, NULL, ?, ?)
 	`, objectID, "objects/"+objectID, now, now); err != nil {
 		t.Fatalf("insertObject(%s): %v", objectID, err)
+	}
+	if err := database.AssociateObjectWithWorkspace(workspaceID, objectID); err != nil {
+		t.Fatalf("AssociateObjectWithWorkspace(%s, %s): %v", workspaceID, objectID, err)
 	}
 }
 

@@ -14,12 +14,12 @@ func (a *API) handleBootstrap(w http.ResponseWriter, r *http.Request, sess *db.S
 	}
 	roots, err := a.db.ActiveRoots(sess.WorkspaceID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "db_error", "database error", err)
 		return
 	}
 	currentSeq, err := a.db.CurrentSeq(sess.WorkspaceID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		a.writeLoggedError(w, http.StatusInternalServerError, "db_error", "database error", err)
 		return
 	}
 	resp := protocol.BootstrapResponse{

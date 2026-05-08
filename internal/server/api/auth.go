@@ -13,7 +13,7 @@ func (a *API) withSession(next func(http.ResponseWriter, *http.Request, *db.Sess
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, err := a.sessionFromRequest(r)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+			writeError(w, http.StatusUnauthorized, "unauthorized", "")
 			return
 		}
 		next(w, r, sess)

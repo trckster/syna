@@ -11,12 +11,23 @@ import (
 
 func (db *DB) SaveChallenge(workspaceID, deviceID, deviceName string, clientNonce, serverNonce []byte) error {
 	now := time.Now().UTC()
+	if _, err := db.PruneExpiredChallenges(now); err != nil {
+		return err
+	}
 	_, err := db.SQL.Exec(`
 		INSERT OR REPLACE INTO session_challenges
 		(workspace_id, device_id, client_nonce, server_nonce, device_name, expires_at, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, workspaceID, deviceID, clientNonce, serverNonce, deviceName, now.Add(60*time.Second), now)
 	return err
+}
+
+func (db *DB) PruneExpiredChallenges(now time.Time) (int64, error) {
+	res, err := db.SQL.Exec(`DELETE FROM session_challenges WHERE expires_at <= ?`, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (db *DB) LoadChallenge(workspaceID, deviceID string, clientNonce []byte) ([]byte, string, time.Time, error) {
