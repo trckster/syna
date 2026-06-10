@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,4 +138,30 @@ func waitForAnyChange(t *testing.T, changes <-chan Change, wantHints map[string]
 			t.Fatalf("timed out waiting for any of %v", wantHints)
 		}
 	}
+}
+
+func TestManagerWatchErrorTriggersFullRescanOfAllRoots(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	changes := make(chan Change, 32)
+	m, err := New(func(change Change) {
+		changes <- change
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.Close()
+	if err := m.AddRoot("root-a", rootA); err != nil {
+		t.Fatalf("AddRoot(a): %v", err)
+	}
+	if err := m.AddRoot("root-b", rootB); err != nil {
+		t.Fatalf("AddRoot(b): %v", err)
+	}
+
+	// Simulate an inotify failure (e.g. event queue overflow); every root
+	// must receive a full-rescan change with no path hint.
+	m.watcher.Errors <- errors.New("simulated overflow")
+
+	waitForRootChange(t, changes, "root-a", "")
+	waitForRootChange(t, changes, "root-b", "")
 }

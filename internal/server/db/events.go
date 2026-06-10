@@ -94,7 +94,11 @@ func (db *DB) SubmitEvent(sess *Session, req protocol.EventSubmitRequest) (*Subm
 		case err != nil:
 			return nil, err
 		default:
-			if headSeq != *req.BaseSeq {
+			// A base_seq ahead of the path head is fine: the path has not
+			// changed since the client's baseline (clients bootstrapped from
+			// a snapshot only know the snapshot's base seq, not per-path
+			// heads). Only a head newer than the baseline is a real conflict.
+			if headSeq > *req.BaseSeq {
 				return nil, &PathHeadMismatchError{CurrentSeq: headSeq}
 			}
 		}

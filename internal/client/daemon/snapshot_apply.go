@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,6 +54,13 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 	if homeRel != root.HomeRelPath || commoncrypto.RootID(d.keys, homeRel) != root.RootID {
 		return &applier.IntegrityError{Message: "rejected snapshot with invalid root binding"}
 	}
+	var priorEntries map[string]state.Entry
+	if !stageOnly {
+		priorEntries, err = d.stateDB.EntriesForRoot(root.RootID)
+		if err != nil {
+			return err
+		}
+	}
 	var entries []state.Entry
 	for _, entry := range snapshot.Entries {
 		relPath, target, pathID, err := d.resolveSnapshotTarget(root, entry.Path, entry.Kind)
@@ -68,17 +76,56 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 				_ = os.Chmod(target, os.FileMode(entry.Mode))
 				_ = os.Chtimes(target, time.Unix(0, entry.MTimeNS), time.Unix(0, entry.MTimeNS))
 			}
+			dirSeq := baseSeq
+			if prior, ok := priorEntries[relPath]; ok && !prior.Deleted && prior.Kind == protocol.RootKindDir && prior.Mode == entry.Mode && prior.MTimeNS == entry.MTimeNS {
+				dirSeq = prior.CurrentSeq
+			}
 			entries = append(entries, state.Entry{
 				RootID:     root.RootID,
 				RelPath:    relPath,
 				PathID:     pathID,
 				Kind:       protocol.RootKindDir,
-				CurrentSeq: baseSeq,
+				CurrentSeq: dirSeq,
 				Mode:       entry.Mode,
 				MTimeNS:    entry.MTimeNS,
 			})
 		case protocol.RootKindFile:
-			if !stageOnly {
+			materialize := !stageOnly
+			if materialize {
+				localHash, localExists, err := fileSHA256Hex(target)
+				if err != nil {
+					return err
+				}
+				if localExists {
+					prior, hasPrior := priorEntries[relPath]
+					switch {
+					case localHash == entry.ContentSHA256:
+						// Local content already matches the snapshot; no
+						// need to download or rewrite the file.
+						materialize = false
+					case hasPrior && !prior.Deleted && prior.ContentSHA256 == localHash:
+						// Local file unchanged since last sync; the snapshot
+						// is strictly newer, apply it normally.
+					case hasPrior && !prior.Deleted && prior.ContentSHA256 == entry.ContentSHA256:
+						// Snapshot matches our last synced state but the
+						// local file was edited since: the local edit is
+						// strictly newer. Keep it; the post-bootstrap rescan
+						// will upload it.
+						d.logger.Printf("snapshot %s: keeping newer local edit of %s", root.HomeRelPath, relPath)
+						materialize = false
+					default:
+						// Both sides diverged (or we have no baseline).
+						// Preserve the local version as a conflict copy
+						// before applying the snapshot.
+						conflictPath, err := d.preserveLocalConflictCopy(root, relPath, target)
+						if err != nil {
+							return err
+						}
+						d.logger.Printf("snapshot %s: local %s diverged from snapshot; preserved local copy as %s", root.HomeRelPath, relPath, conflictPath)
+					}
+				}
+			}
+			if materialize {
 				if err := d.ensureSafeParentDirs(root, target); err != nil {
 					return err
 				}
@@ -143,12 +190,20 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 				_ = os.Chmod(target, os.FileMode(entry.Mode))
 				_ = os.Chtimes(target, time.Unix(0, entry.MTimeNS), time.Unix(0, entry.MTimeNS))
 			}
+			fileSeq := baseSeq
+			if prior, ok := priorEntries[relPath]; ok && !prior.Deleted && prior.Kind == protocol.RootKindFile && prior.ContentSHA256 == entry.ContentSHA256 {
+				// The path is unchanged remotely since our last synced state;
+				// the previously recorded per-path head seq is still correct,
+				// while the snapshot's base seq would not match the server's
+				// path head on the next submit.
+				fileSeq = prior.CurrentSeq
+			}
 			entries = append(entries, state.Entry{
 				RootID:        root.RootID,
 				RelPath:       relPath,
 				PathID:        pathID,
 				Kind:          protocol.RootKindFile,
-				CurrentSeq:    baseSeq,
+				CurrentSeq:    fileSeq,
 				ContentSHA256: entry.ContentSHA256,
 				SizeBytes:     entry.SizeBytes,
 				Mode:          entry.Mode,
@@ -211,6 +266,63 @@ func (d *Daemon) rejectSymlinkParents(root state.Root, target string) error {
 	default:
 		return fmt.Errorf("unsupported root kind %s", root.Kind)
 	}
+}
+
+func fileSHA256Hex(path string) (string, bool, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", false, nil
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", false, err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), true, nil
+}
+
+func (d *Daemon) preserveLocalConflictCopy(root state.Root, relPath, target string) (string, error) {
+	name := conflictRelPath(relPath, root.TargetAbsPath, d.cfg.DeviceName, time.Now().UTC())
+	dir := filepath.Dir(target)
+	dst := filepath.Join(dir, filepath.Base(filepath.FromSlash(name)))
+	src, err := os.Open(target)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	tmp, err := os.CreateTemp(dir, ".syna-conflict-*")
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return dst, nil
 }
 
 func (d *Daemon) validateChunkRef(chunk protocol.ChunkRef) error {

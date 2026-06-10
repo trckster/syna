@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 
 	"syna/internal/client/applier"
 	"syna/internal/client/configstore"
@@ -756,6 +757,38 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 		return markLifecycle(protocol.IssueTransport, err)
 	}
 	defer ws.Close()
+	return d.streamEvents(ctx, ws)
+}
+
+var (
+	wsClientPongWait  = 75 * time.Second
+	wsClientPingEvery = 25 * time.Second
+	wsClientWriteWait = 10 * time.Second
+)
+
+func (d *Daemon) streamEvents(ctx context.Context, ws *websocket.Conn) error {
+	_ = ws.SetReadDeadline(time.Now().Add(wsClientPongWait))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(wsClientPongWait))
+	})
+	pingCtx, cancelPing := context.WithCancel(ctx)
+	defer cancelPing()
+	go func() {
+		ticker := time.NewTicker(wsClientPingEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				_ = ws.Close()
+				return
+			case <-ticker.C:
+				if err := ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(wsClientWriteWait)); err != nil {
+					_ = ws.Close()
+					return
+				}
+			}
+		}
+	}()
 	for {
 		var msg protocol.WSMessage
 		if err := ws.ReadJSON(&msg); err != nil {
@@ -1222,14 +1255,15 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 		}
 		resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventFilePut, &baseSeq, up.Payload, up.Refs)
 		if err != nil {
-			if allowRetry {
-				var conflict *PathConflictError
-				if errors.As(err, &conflict) {
-					if err := d.resolveFileConflict(ctx, *root, item, conflict); err != nil {
-						return err
-					}
+			var conflict *PathConflictError
+			if errors.As(err, &conflict) {
+				if err := d.resolveFileConflict(ctx, *root, item, conflict); err != nil {
+					return err
+				}
+				if allowRetry {
 					return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable)
 				}
+				continue
 			}
 			if queueRetryable && isRetryableSyncError(err) {
 				return d.queuePendingRootRescan(rootID, err)

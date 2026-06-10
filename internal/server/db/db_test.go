@@ -379,3 +379,73 @@ func assertObjectMissing(t *testing.T, database *DB, objectID string) {
 func ptrInt64(v int64) *int64 {
 	return &v
 }
+
+func TestPathHeadAllowsBaseSeqAheadOfHead(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add): %v", err)
+	}
+	putResp, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(0),
+		PayloadBlob: "file-put-v1",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(file_put v1): %v", err)
+	}
+
+	// A snapshot-bootstrapped client only knows the snapshot's base seq,
+	// which can be ahead of the per-path head. The path has not changed since
+	// that baseline, so the submit must be accepted.
+	aheadResp, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(putResp.AcceptedSeq + 5),
+		PayloadBlob: "file-put-v2",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(base_seq ahead of head): %v", err)
+	}
+
+	// A baseline older than the head is a genuine conflict and must still be
+	// rejected with the current head seq.
+	_, err = database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(putResp.AcceptedSeq),
+		PayloadBlob: "file-put-stale",
+	})
+	var mismatch *PathHeadMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("expected PathHeadMismatchError, got %v", err)
+	}
+	if mismatch.CurrentSeq != aheadResp.AcceptedSeq {
+		t.Fatalf("mismatch current seq = %d want %d", mismatch.CurrentSeq, aheadResp.AcceptedSeq)
+	}
+
+	// A brand-new path with a nonzero baseline is still rejected.
+	_, err = database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-2",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(3),
+		PayloadBlob: "file-put-new",
+	})
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("expected PathHeadMismatchError for unknown path, got %v", err)
+	}
+}

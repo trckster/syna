@@ -25,6 +25,12 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		return err
 	}
 	defer cleanup()
+	var baselineHash string
+	if entries, err := d.stateDB.EntriesForRoot(root.RootID); err != nil {
+		return err
+	} else if prior, ok := entries[item.RelPath]; ok && !prior.Deleted && prior.Kind == protocol.RootKindFile {
+		baselineHash = prior.ContentSHA256
+	}
 	if err := d.applyCurrentRemoteHead(ctx, conflict.CurrentSeq); err != nil {
 		return err
 	}
@@ -33,6 +39,11 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		return err
 	}
 	if retryOnly || matches {
+		return nil
+	}
+	if done, err := d.restoreNewerLocalEdit(ctx, root, item, stagedPath, baselineHash); err != nil {
+		return err
+	} else if done {
 		return nil
 	}
 	for attempt := 0; attempt < 5; attempt++ {
@@ -81,6 +92,81 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		}
 	}
 	return fmt.Errorf("conflict copy upload retries exhausted")
+}
+
+// restoreNewerLocalEdit handles the common stale-head case: the remote head's
+// content is identical to the baseline we had last synced, meaning only the
+// local side changed and our recorded path-head seq was simply outdated (e.g.
+// entries rebuilt from a snapshot). Instead of demoting the local edit to a
+// conflict copy, restore it over the just-applied remote content and upload it
+// with the corrected head seq.
+func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, item scanner.Entry, stagedPath, baselineHash string) (bool, error) {
+	if baselineHash == "" || baselineHash == item.ContentSHA256 {
+		return false, nil
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		return false, err
+	}
+	current, ok := entries[item.RelPath]
+	if !ok || current.Deleted || current.Kind != protocol.RootKindFile || current.ContentSHA256 != baselineHash {
+		return false, nil
+	}
+	src, err := os.Open(stagedPath)
+	if err != nil {
+		return false, err
+	}
+	defer src.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(item.AbsPath), ".syna-restore-*")
+	if err != nil {
+		return false, err
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return false, err
+	}
+	if err := os.Rename(tmp.Name(), item.AbsPath); err != nil {
+		_ = os.Remove(tmp.Name())
+		return false, err
+	}
+	_ = os.Chmod(item.AbsPath, os.FileMode(item.Mode))
+	_ = os.Chtimes(item.AbsPath, time.Unix(0, item.MTimeNS), time.Unix(0, item.MTimeNS))
+	pathID := commoncrypto.PathID(d.keys, root.RootID, item.RelPath)
+	up, err := uploader.UploadFile(ctx, d.conn, d.keys.BlobKey, d.cfg.WorkspaceID, root.RootID, pathID, item.RelPath, item.AbsPath, item.Mode, item.MTimeNS)
+	if err != nil {
+		return false, err
+	}
+	resp, err := d.submitEvent(ctx, root.RootID, pathID, "", protocol.EventFilePut, &current.CurrentSeq, up.Payload, up.Refs)
+	if err != nil {
+		var conflict *PathConflictError
+		if errors.As(err, &conflict) {
+			// Lost another race; fall back to the conflict-copy path.
+			return false, nil
+		}
+		return false, err
+	}
+	d.logger.Printf("conflict %s: kept newer local edit of %s", root.HomeRelPath, item.RelPath)
+	return true, d.stateDB.UpsertEntry(state.Entry{
+		RootID:        root.RootID,
+		RelPath:       item.RelPath,
+		PathID:        pathID,
+		Kind:          protocol.RootKindFile,
+		CurrentSeq:    resp.AcceptedSeq,
+		ContentSHA256: up.Payload.ContentSHA256,
+		SizeBytes:     up.Payload.SizeBytes,
+		Mode:          up.Payload.Mode,
+		MTimeNS:       up.Payload.MTimeNS,
+	})
 }
 
 func (d *Daemon) remoteHeadAllowsRetry(rootID string, item scanner.Entry) (bool, bool, error) {

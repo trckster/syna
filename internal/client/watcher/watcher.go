@@ -152,7 +152,22 @@ func (m *Manager) loop() {
 			if !ok {
 				return
 			}
+			// Watch errors (notably inotify queue overflow) mean events may
+			// have been lost; trigger a full rescan of every tracked root.
+			m.notifyAllRoots()
 		}
+	}
+}
+
+func (m *Manager) notifyAllRoots() {
+	m.mu.Lock()
+	rootIDs := make([]string, 0, len(m.rootDirs))
+	for rootID := range m.rootDirs {
+		rootIDs = append(rootIDs, rootID)
+	}
+	m.mu.Unlock()
+	for _, rootID := range rootIDs {
+		m.onChange(Change{RootID: rootID})
 	}
 }
 
