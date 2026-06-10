@@ -147,10 +147,12 @@ go vet ./...
 ./scripts/smoke.sh
 ```
 
-Build release archives:
+New release:
 
 ```bash
-./scripts/release.sh
+VERSION=vX.Y.Z ./scripts/release.sh
+gh release create vX.Y.Z dist/syna-vX.Y.Z-linux-*.tar.gz \
+    --title vX.Y.Z --notes "Lorem ipsum"
 ```
 
 ## Known Limitations
