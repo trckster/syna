@@ -18,11 +18,12 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 	defer tx.Rollback()
 
 	var removedSeq sql.NullInt64
+	var latestSnapshotSeq sql.NullInt64
 	err = tx.QueryRow(`
-		SELECT removed_seq
+		SELECT removed_seq, latest_snapshot_seq
 		FROM roots
 		WHERE workspace_id = ? AND root_id = ?
-	`, sess.WorkspaceID, req.RootID).Scan(&removedSeq)
+	`, sess.WorkspaceID, req.RootID).Scan(&removedSeq, &latestSnapshotSeq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("unknown root")
 	}
@@ -31,6 +32,16 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 	}
 	if removedSeq.Valid {
 		return fmt.Errorf("root removed")
+	}
+	if latestSnapshotSeq.Valid && req.BaseSeq < latestSnapshotSeq.Int64 {
+		return fmt.Errorf("stale snapshot")
+	}
+	var currentSeq int64
+	if err := tx.QueryRow(`SELECT current_seq FROM workspaces WHERE workspace_id = ?`, sess.WorkspaceID).Scan(&currentSeq); err != nil {
+		return err
+	}
+	if req.BaseSeq > currentSeq {
+		return fmt.Errorf("snapshot base seq beyond workspace head")
 	}
 	if !objectVisibleToWorkspace(tx, sess.WorkspaceID, req.ObjectID) {
 		return fmt.Errorf("missing snapshot object")

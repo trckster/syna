@@ -125,6 +125,21 @@ func waitForRootChange(t *testing.T, changes <-chan Change, wantRootID, wantHint
 	}
 }
 
+func waitForRootChanges(t *testing.T, changes <-chan Change, want map[string]string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for len(want) > 0 {
+		select {
+		case change := <-changes:
+			if hint, ok := want[change.RootID]; ok && change.RelPathHint == hint {
+				delete(want, change.RootID)
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for root changes %v", want)
+		}
+	}
+}
+
 func waitForAnyChange(t *testing.T, changes <-chan Change, wantHints map[string]bool) {
 	t.Helper()
 	deadline := time.After(3 * time.Second)
@@ -162,6 +177,8 @@ func TestManagerWatchErrorTriggersFullRescanOfAllRoots(t *testing.T) {
 	// must receive a full-rescan change with no path hint.
 	m.watcher.Errors <- errors.New("simulated overflow")
 
-	waitForRootChange(t, changes, "root-a", "")
-	waitForRootChange(t, changes, "root-b", "")
+	waitForRootChanges(t, changes, map[string]string{
+		"root-a": "",
+		"root-b": "",
+	})
 }

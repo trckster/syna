@@ -214,6 +214,154 @@ func TestSnapshotRequiresActiveRootAndExistingRefs(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotRejectsStaleSnapshotAfterPrune(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	insertObject(t, database, "snapshot-new")
+	insertObject(t, database, "snapshot-stale")
+
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add): %v", err)
+	}
+	staleBase, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(0),
+		PayloadBlob: "file-put-stale",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(file_put stale): %v", err)
+	}
+	newBase, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(staleBase.AcceptedSeq),
+		PayloadBlob: "file-put-new",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(file_put new): %v", err)
+	}
+	if err := database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  newBase.AcceptedSeq,
+		ObjectID: "snapshot-new",
+	}); err != nil {
+		t.Fatalf("SaveSnapshot(new): %v", err)
+	}
+	if deletedEvents, _, _, err := database.Prune(time.Now().UTC().Add(time.Hour), 0, 24*time.Hour); err != nil {
+		t.Fatalf("Prune: %v", err)
+	} else if deletedEvents != 3 {
+		t.Fatalf("deleted events = %d want 3", deletedEvents)
+	}
+
+	if err := database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  staleBase.AcceptedSeq,
+		ObjectID: "snapshot-stale",
+	}); err == nil {
+		t.Fatalf("expected stale snapshot to be rejected")
+	}
+
+	roots, err := database.ActiveRoots(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("ActiveRoots: %v", err)
+	}
+	if len(roots) != 1 {
+		t.Fatalf("roots = %d want 1", len(roots))
+	}
+	if !roots[0].LatestSnapshotSeq.Valid || roots[0].LatestSnapshotSeq.Int64 != newBase.AcceptedSeq {
+		t.Fatalf("latest snapshot seq = %+v want %d", roots[0].LatestSnapshotSeq, newBase.AcceptedSeq)
+	}
+	if !roots[0].LatestSnapshotObjectID.Valid || roots[0].LatestSnapshotObjectID.String != "snapshot-new" {
+		t.Fatalf("latest snapshot object = %+v want snapshot-new", roots[0].LatestSnapshotObjectID)
+	}
+	floor, err := database.RetainedFloor(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("RetainedFloor: %v", err)
+	}
+	if floor != newBase.AcceptedSeq {
+		t.Fatalf("retained floor = %d want %d", floor, newBase.AcceptedSeq)
+	}
+	assertObjectRefCount(t, database, "snapshot-stale", 0)
+}
+
+func TestSaveSnapshotAcceptsEqualLatestSnapshotSeq(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	insertObject(t, database, "snapshot-1")
+	insertObject(t, database, "snapshot-2")
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add): %v", err)
+	}
+	currentSeq, err := database.CurrentSeq(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq: %v", err)
+	}
+	if err := database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  currentSeq,
+		ObjectID: "snapshot-1",
+	}); err != nil {
+		t.Fatalf("SaveSnapshot(initial): %v", err)
+	}
+	if err := database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  currentSeq,
+		ObjectID: "snapshot-2",
+	}); err != nil {
+		t.Fatalf("SaveSnapshot(equal latest seq): %v", err)
+	}
+}
+
+func TestSaveSnapshotRejectsFutureBaseSeq(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	insertObject(t, database, "snapshot-future")
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add): %v", err)
+	}
+	currentSeq, err := database.CurrentSeq(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq: %v", err)
+	}
+	if err := database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  currentSeq + 1,
+		ObjectID: "snapshot-future",
+	}); err == nil {
+		t.Fatalf("expected future snapshot to be rejected")
+	}
+}
+
 func TestSubmitEventRejectsUnsupportedEventType(t *testing.T) {
 	database := openTestDB(t)
 	sess := testSession()
