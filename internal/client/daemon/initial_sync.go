@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"syna/internal/client/scanner"
@@ -16,6 +17,12 @@ type initialRootSync struct {
 	Entries    []state.Entry
 	Snapshot   protocol.SnapshotPayload
 	ObjectRefs []string
+	Conflict   *initialRootConflict
+}
+
+type initialRootConflict struct {
+	Item scanner.Entry
+	Err  *PathConflictError
 }
 
 func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPath string, scan *scanner.Result, progress AddProgressFunc, progressState *addProgressState) (*initialRootSync, error) {
@@ -30,7 +37,11 @@ func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPa
 		pathID := commoncrypto.PathID(d.keys, rootID, item.RelPath)
 		if item.Kind == protocol.RootKindDir {
 			if err := d.submitInitialDir(ctx, sync, rootID, pathID, item); err != nil {
-				return nil, err
+				var conflict *PathConflictError
+				if errors.As(err, &conflict) {
+					sync.Conflict = &initialRootConflict{Item: item, Err: conflict}
+				}
+				return sync, err
 			}
 			progressState.DoneEntries++
 			reportAddProgress(progress, AddProgress{
@@ -48,7 +59,11 @@ func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPa
 		}
 		if item.Kind == protocol.RootKindFile {
 			if err := d.submitInitialFile(ctx, sync, rootID, pathID, item, homeRelPath, progress, progressState); err != nil {
-				return nil, err
+				var conflict *PathConflictError
+				if errors.As(err, &conflict) {
+					sync.Conflict = &initialRootConflict{Item: item, Err: conflict}
+				}
+				return sync, err
 			}
 		}
 	}

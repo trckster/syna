@@ -31,14 +31,38 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 	} else if prior, ok := entries[item.RelPath]; ok && !prior.Deleted && prior.Kind == protocol.RootKindFile {
 		baselineHash = prior.ContentSHA256
 	}
-	if err := d.applyCurrentRemoteHead(ctx, conflict.CurrentSeq); err != nil {
+	event, err := d.fetchCurrentRemoteHead(ctx, conflict.CurrentSeq)
+	if err != nil {
+		return err
+	}
+	removedForDirectory := false
+	if event.EventType == protocol.EventDirPut {
+		info, err := os.Lstat(item.AbsPath)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("local conflict path is no longer a regular file")
+		}
+		if err := os.Remove(item.AbsPath); err != nil {
+			return err
+		}
+		removedForDirectory = true
+	}
+	if err := d.applyRemoteEvent(ctx, event); err != nil {
+		if removedForDirectory {
+			_ = d.restoreStagedFile(item, stagedPath)
+		}
 		return err
 	}
 	retryOnly, matches, err := d.remoteHeadAllowsRetry(root.RootID, item)
 	if err != nil {
 		return err
 	}
-	if retryOnly || matches {
+	if retryOnly {
+		return d.restoreStagedFile(item, stagedPath)
+	}
+	if matches {
 		return nil
 	}
 	if done, err := d.restoreNewerLocalEdit(ctx, root, item, stagedPath, baselineHash); err != nil {
@@ -112,35 +136,9 @@ func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, ite
 	if !ok || current.Deleted || current.Kind != protocol.RootKindFile || current.ContentSHA256 != baselineHash {
 		return false, nil
 	}
-	src, err := os.Open(stagedPath)
-	if err != nil {
+	if err := d.restoreStagedFile(item, stagedPath); err != nil {
 		return false, err
 	}
-	defer src.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(item.AbsPath), ".syna-restore-*")
-	if err != nil {
-		return false, err
-	}
-	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return false, err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return false, err
-	}
-	if err := os.Rename(tmp.Name(), item.AbsPath); err != nil {
-		_ = os.Remove(tmp.Name())
-		return false, err
-	}
-	_ = os.Chmod(item.AbsPath, os.FileMode(item.Mode))
-	_ = os.Chtimes(item.AbsPath, time.Unix(0, item.MTimeNS), time.Unix(0, item.MTimeNS))
 	pathID := commoncrypto.PathID(d.keys, root.RootID, item.RelPath)
 	up, err := uploader.UploadFile(ctx, d.conn, d.keys.BlobKey, d.cfg.WorkspaceID, root.RootID, pathID, item.RelPath, item.AbsPath, item.Mode, item.MTimeNS)
 	if err != nil {
@@ -167,6 +165,39 @@ func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, ite
 		Mode:          up.Payload.Mode,
 		MTimeNS:       up.Payload.MTimeNS,
 	})
+}
+
+func (d *Daemon) restoreStagedFile(item scanner.Entry, stagedPath string) error {
+	src, err := os.Open(stagedPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(item.AbsPath), ".syna-restore-*")
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), item.AbsPath); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	_ = os.Chmod(item.AbsPath, os.FileMode(item.Mode))
+	_ = os.Chtimes(item.AbsPath, time.Unix(0, item.MTimeNS), time.Unix(0, item.MTimeNS))
+	return nil
 }
 
 func (d *Daemon) remoteHeadAllowsRetry(rootID string, item scanner.Entry) (bool, bool, error) {

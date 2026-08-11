@@ -416,7 +416,7 @@ func (d *Daemon) AddRoot(ctx context.Context, input string) error {
 	return d.AddRootWithProgress(ctx, input, nil)
 }
 
-func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress AddProgressFunc) error {
+func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress AddProgressFunc) (returnErr error) {
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
 	d.mu.Lock()
@@ -489,13 +489,31 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		return err
 	}
 	rootCreatedSeq := rootAddResp.AcceptedSeq
+	finalized := false
+	defer func() {
+		if finalized || returnErr == nil {
+			return
+		}
+		if recoveryErr := d.preserveInitialRootRecovery(rootID); recoveryErr != nil {
+			returnErr = fmt.Errorf("%v; queue initial-root recovery: %w", returnErr, recoveryErr)
+		}
+	}()
 
 	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan, progress, totals)
-	if err != nil {
-		return err
+	if initialSync == nil {
+		initialSync = &initialRootSync{}
 	}
 	if err := d.stateDB.ReplaceEntries(rootID, initialSync.Entries); err != nil {
 		return err
+	}
+	collided := initialSync.Conflict != nil
+	if err != nil {
+		if !collided {
+			return fmt.Errorf("initial root upload: %w", err)
+		}
+		if recoveryErr := d.recoverInitialRootConflict(ctx, root, *initialSync.Conflict); recoveryErr != nil {
+			return fmt.Errorf("recover initial path conflict at %q: %w", initialSync.Conflict.Item.RelPath, recoveryErr)
+		}
 	}
 	if err := d.bootstrapOrCatchUp(ctx); err != nil {
 		return err
@@ -515,9 +533,31 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		}
 		return replaceErr
 	}
+	if collided {
+		if err := d.rescanRoot(ctx, rootID); err != nil {
+			return fmt.Errorf("reconcile initial path conflict: %w", err)
+		}
+		if _, err := d.activeRootAfterInitialSync(rootID, homeRelPath); err != nil {
+			return err
+		}
+		matched, remoteActive, verifyErr = d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+		if verifyErr != nil {
+			return fmt.Errorf("verify root after initial conflict recovery: %w", verifyErr)
+		}
+		if !remoteActive {
+			return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		if !matched {
+			done, replaceErr := d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+			if !done {
+				d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+			}
+			return replaceErr
+		}
+	}
 	reportAddProgress(progress, AddProgress{
 		Stage:        "finalizing",
-		Message:      "publishing snapshot",
+		Message:      map[bool]string{true: "finishing reconciliation", false: "publishing snapshot"}[collided],
 		Path:         homeRelPath,
 		DoneBytes:    totals.DoneBytes,
 		TotalBytes:   totals.TotalBytes,
@@ -526,7 +566,10 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		DoneEntries:  totals.DoneEntries,
 		TotalEntries: totals.TotalEntries,
 	})
-	publishErr := d.publishInitialSnapshot(ctx, rootID, initialSync)
+	var publishErr error
+	if !collided {
+		publishErr = d.publishInitialSnapshot(ctx, rootID, initialSync)
+	}
 	if catchUpErr := d.bootstrapOrCatchUp(ctx); catchUpErr != nil {
 		d.logger.Printf("could not catch up root %s after snapshot publication: %v", rootID, catchUpErr)
 		if retryErr := d.bootstrapOrCatchUp(ctx); retryErr != nil {
@@ -564,7 +607,10 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		d.enqueueRootRescan(rootID)
 		return fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
 	}
-	d.addWatcherRoot(rootID, currentRoot.TargetAbsPath)
+	if !d.addWatcherRoot(rootID, currentRoot.TargetAbsPath) {
+		return fmt.Errorf("root %q is active but its watcher could not be installed; recovery was queued", homeRelPath)
+	}
+	finalized = true
 	reportAddProgress(progress, AddProgress{
 		Stage:        "done",
 		Message:      "sync complete",
@@ -576,6 +622,107 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		DoneEntries:  totals.TotalEntries,
 		TotalEntries: totals.TotalEntries,
 	})
+	return nil
+}
+
+func (d *Daemon) recoverInitialRootConflict(ctx context.Context, root state.Root, collision initialRootConflict) error {
+	if collision.Item.Kind == protocol.RootKindFile {
+		return d.resolveFileConflict(ctx, root, collision.Item, collision.Err)
+	}
+	event, err := d.fetchCurrentRemoteHead(ctx, collision.Err.CurrentSeq)
+	if err != nil {
+		return err
+	}
+	if event.EventType != protocol.EventDirPut {
+		return d.preserveInitialDirectoryTypeConflict(ctx, root, collision.Item, event)
+	}
+	if err := d.applyRemoteEvent(ctx, event); err != nil {
+		return err
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		return err
+	}
+	remote, ok := entries[collision.Item.RelPath]
+	if !ok || remote.Deleted || remote.Kind != protocol.RootKindDir {
+		return fmt.Errorf("remote head does not represent the expected directory")
+	}
+	return nil
+}
+
+func (d *Daemon) preserveInitialDirectoryTypeConflict(ctx context.Context, root state.Root, item scanner.Entry, event protocol.EventRecord) error {
+	if item.RelPath == "" {
+		return errors.New("cannot preserve a type conflict at the directory root")
+	}
+	var preservedRelPath string
+	for attempt := 0; attempt < 5; attempt++ {
+		candidate := conflictRelPath(item.RelPath, root.TargetAbsPath, d.cfg.DeviceName, time.Now().UTC().Add(time.Duration(attempt)*time.Second))
+		candidateAbsPath := filepath.Join(root.TargetAbsPath, filepath.FromSlash(candidate))
+		if _, err := os.Lstat(candidateAbsPath); errors.Is(err, os.ErrNotExist) {
+			preservedRelPath = candidate
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+	if preservedRelPath == "" {
+		return errors.New("could not allocate a directory conflict-copy path")
+	}
+	conflictAbsPath := filepath.Join(root.TargetAbsPath, filepath.FromSlash(preservedRelPath))
+	if err := paths.RejectSymlinkParents(root.TargetAbsPath, item.AbsPath); err != nil {
+		return err
+	}
+	if err := paths.RejectSymlinkParents(root.TargetAbsPath, conflictAbsPath); err != nil {
+		return err
+	}
+	if err := os.Rename(item.AbsPath, conflictAbsPath); err != nil {
+		return err
+	}
+	if err := d.applyRemoteEvent(ctx, event); err != nil {
+		_ = os.Rename(conflictAbsPath, item.AbsPath)
+		return err
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		_ = os.RemoveAll(item.AbsPath)
+		_ = os.Rename(conflictAbsPath, item.AbsPath)
+		return err
+	}
+	remote, ok := entries[item.RelPath]
+	materialized := ok && remote.CurrentSeq == event.Seq
+	if event.EventType == protocol.EventDelete {
+		materialized = materialized && remote.Deleted
+	} else {
+		materialized = materialized && !remote.Deleted && remote.Kind == protocol.RootKindFile
+	}
+	if !materialized {
+		_ = os.RemoveAll(item.AbsPath)
+		if err := os.Rename(conflictAbsPath, item.AbsPath); err != nil {
+			return fmt.Errorf("remote type head was rejected and local directory restoration failed: %w", err)
+		}
+		return errors.New("remote type head was not materialized")
+	}
+	d.logger.Printf("conflict %s: preserved local directory %s as %s", root.HomeRelPath, item.RelPath, preservedRelPath)
+	return nil
+}
+
+func (d *Daemon) preserveInitialRootRecovery(rootID string) error {
+	root, err := d.stateDB.RootByID(rootID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if root.State != protocol.RootStateActive {
+		return nil
+	}
+	if err := d.stateDB.QueueRootRescan(rootID, time.Now().UTC()); err != nil {
+		return err
+	}
+	if !d.isRootStaged(rootID) {
+		d.addWatcherRoot(rootID, root.TargetAbsPath)
+	}
 	return nil
 }
 
@@ -711,7 +858,9 @@ func (d *Daemon) retryInitialRootFinalization(ctx context.Context, rootID, homeR
 		d.enqueueRootRescan(rootID)
 		return true, fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
 	}
-	d.addWatcherRoot(rootID, root.TargetAbsPath)
+	if !d.addWatcherRoot(rootID, root.TargetAbsPath) {
+		return false, fmt.Errorf("watcher could not monitor %s", root.TargetAbsPath)
+	}
 	return true, nil
 }
 
@@ -1790,6 +1939,25 @@ func (d *Daemon) applyCurrentRemoteHead(ctx context.Context, seq int64) error {
 	return fmt.Errorf("remote head %d not found", seq)
 }
 
+func (d *Daemon) fetchCurrentRemoteHead(ctx context.Context, seq int64) (protocol.EventRecord, error) {
+	if seq <= 0 {
+		return protocol.EventRecord{}, fmt.Errorf("invalid remote head %d", seq)
+	}
+	resp, apiErr, err := d.conn.FetchEvents(ctx, seq-1, 8)
+	if err != nil {
+		if apiErr != nil && apiErr.Code == "resync_required" {
+			return protocol.EventRecord{}, fmt.Errorf("remote head %d requires a full bootstrap", seq)
+		}
+		return protocol.EventRecord{}, err
+	}
+	for _, event := range resp.Events {
+		if event.Seq == seq {
+			return event, nil
+		}
+	}
+	return protocol.EventRecord{}, fmt.Errorf("remote head %d not found", seq)
+}
+
 func (d *Daemon) recordScanWarnings(root state.Root, warnings []string) error {
 	prefix := "scanner:" + root.RootID + ":"
 	if err := d.stateDB.ClearWarningsWithPrefix(prefix); err != nil {
@@ -1847,13 +2015,14 @@ func rootPathMissing(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (d *Daemon) addWatcherRoot(rootID, target string) {
+func (d *Daemon) addWatcherRoot(rootID, target string) bool {
 	if err := d.watcher.AddRoot(rootID, target); err != nil {
 		message := fmt.Sprintf("watcher could not monitor %s: %v", target, err)
 		_ = d.stateDB.UpsertWarning("watcher:"+rootID, message, time.Now().UTC())
-		return
+		return false
 	}
 	_ = d.stateDB.ClearWarningsWithPrefix("watcher:" + rootID)
+	return true
 }
 
 func warningIssueKind(key string) protocol.DaemonIssueKind {
