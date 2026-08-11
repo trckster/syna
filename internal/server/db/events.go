@@ -225,7 +225,7 @@ func (db *DB) FetchEvents(workspaceID string, afterSeq int64, limit int) ([]prot
 	if err != nil {
 		return nil, 0, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var floor, currentSeq int64
 	if err := tx.QueryRow(`

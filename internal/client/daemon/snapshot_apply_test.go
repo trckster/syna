@@ -370,7 +370,7 @@ func TestStreamEventsReturnsCatchUpFailure(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_ = conn.WriteJSON(protocol.WSMessage{
 				Type:  "event",
 				Event: &protocol.EventRecord{Seq: 1},
