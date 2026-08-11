@@ -475,8 +475,7 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 	if err := d.bootstrapOrCatchUp(ctx); err != nil {
 		return err
 	}
-	currentRoot, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
-	if err != nil {
+	if _, err := d.activeRootAfterInitialSync(rootID, homeRelPath); err != nil {
 		return err
 	}
 	matched, remoteActive, verifyErr := d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
@@ -510,7 +509,7 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 			return fmt.Errorf("catch up after initial sync: %v; retry: %w", catchUpErr, retryErr)
 		}
 	}
-	currentRoot, err = d.activeRootAfterInitialSync(rootID, homeRelPath)
+	currentRoot, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
 	if err != nil {
 		return err
 	}
