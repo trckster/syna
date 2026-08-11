@@ -54,6 +54,39 @@ func TestScanSubtreeFileReturnsSingleFile(t *testing.T) {
 	}
 }
 
+func TestScanIgnoresInternalStagingFiles(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "keep.txt"), "keep")
+	mustWriteFile(t, filepath.Join(root, ".syna-download-1"), "staged")
+	mustWriteFile(t, filepath.Join(root, ".syna-bootstrap-2", "nested.txt"), "staged")
+
+	result, err := ScanRoot(root)
+	if err != nil {
+		t.Fatalf("ScanRoot: %v", err)
+	}
+	var rels []string
+	for _, entry := range result.Entries {
+		rels = append(rels, entry.RelPath)
+	}
+	want := []string{"", "keep.txt"}
+	if len(rels) != len(want) {
+		t.Fatalf("unexpected entries %v want %v", rels, want)
+	}
+	for i := range want {
+		if rels[i] != want[i] {
+			t.Fatalf("unexpected entries %v want %v", rels, want)
+		}
+	}
+
+	hinted, err := ScanSubtree(root, ".syna-download-already-renamed")
+	if err != nil {
+		t.Fatalf("ScanSubtree(internal staging path): %v", err)
+	}
+	if len(hinted.Entries) != 0 {
+		t.Fatalf("unexpected staging entries %+v", hinted.Entries)
+	}
+}
+
 func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

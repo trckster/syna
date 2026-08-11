@@ -95,6 +95,34 @@ func TestManagerSupportsFileRootsSharingParent(t *testing.T) {
 	waitForRootChange(t, changes, "root-second", "")
 }
 
+func TestManagerIgnoresInternalStagingFilesButReportsRenameTarget(t *testing.T) {
+	root := t.TempDir()
+	changes := make(chan Change, 32)
+	m, err := New(func(change Change) {
+		changes <- change
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if err := m.AddRoot("root-1", root); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+
+	staging := filepath.Join(root, ".syna-download-1")
+	mustWriteWatcherFile(t, staging, "remote content")
+	assertNoWatcherChange(t, changes, 250*time.Millisecond)
+
+	if err := os.Rename(staging, filepath.Join(root, "final.txt")); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	waitForChange(t, changes, "final.txt")
+}
+
 func mustWriteWatcherFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -152,6 +180,17 @@ func waitForAnyChange(t *testing.T, changes <-chan Change, wantHints map[string]
 		case <-deadline:
 			t.Fatalf("timed out waiting for any of %v", wantHints)
 		}
+	}
+}
+
+func assertNoWatcherChange(t *testing.T, changes <-chan Change, duration time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case change := <-changes:
+		t.Fatalf("unexpected watcher change %+v", change)
+	case <-timer.C:
 	}
 }
 

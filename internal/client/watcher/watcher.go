@@ -130,6 +130,12 @@ func (m *Manager) loop() {
 			if !ok {
 				return
 			}
+			// Atomic remote applies use hidden .syna-* staging paths. Watching
+			// those paths feeds the daemon's own writes back into the scanner and
+			// can publish transient files before they are renamed into place.
+			if isInternalStagingPath(ev.Name) {
+				continue
+			}
 			rootIDs := m.rootsForEvent(ev.Name)
 			if len(rootIDs) > 0 && ev.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Write) != 0 {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
@@ -157,6 +163,10 @@ func (m *Manager) loop() {
 			m.notifyAllRoots()
 		}
 	}
+}
+
+func isInternalStagingPath(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), ".syna-")
 }
 
 func (m *Manager) notifyAllRoots() {

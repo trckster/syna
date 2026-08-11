@@ -314,6 +314,7 @@ Use Linux inotify through `fsnotify`.
 Rules:
 
 - install watches recursively for all directories in active roots
+- reserve child basenames beginning with `.syna-` for atomic-apply staging; watchers and scanners must ignore them
 - when a new directory appears, add a watch immediately
 - debounce bursts for 500 milliseconds
 - on rename or move, rescan the nearest existing ancestor and emit delete plus put semantics
