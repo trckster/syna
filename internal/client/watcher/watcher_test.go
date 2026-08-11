@@ -123,6 +123,24 @@ func TestManagerIgnoresInternalStagingFilesButReportsRenameTarget(t *testing.T) 
 	waitForChange(t, changes, "final.txt")
 }
 
+func TestManagerReportsChangesForPrefixedFileRoot(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".syna-user-file")
+	mustWriteWatcherFile(t, root, "initial")
+	changes := make(chan Change, 8)
+	m, err := New(func(change Change) { changes <- change })
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	if err := m.AddRoot("root-prefixed", root); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+
+	mustWriteWatcherFile(t, root, "updated")
+	waitForRootChange(t, changes, "root-prefixed", "")
+}
+
 func mustWriteWatcherFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

@@ -85,6 +85,14 @@ func TestScanIgnoresInternalStagingFiles(t *testing.T) {
 	if len(hinted.Entries) != 0 {
 		t.Fatalf("unexpected staging entries %+v", hinted.Entries)
 	}
+
+	nestedHint, err := ScanSubtree(root, ".syna-bootstrap-2/nested.txt")
+	if err != nil {
+		t.Fatalf("ScanSubtree(nested internal staging path): %v", err)
+	}
+	if len(nestedHint.Entries) != 0 {
+		t.Fatalf("unexpected nested staging entries %+v", nestedHint.Entries)
+	}
 }
 
 func mustWriteFile(t *testing.T, path, content string) {

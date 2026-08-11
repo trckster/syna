@@ -51,7 +51,7 @@ func scan(rootPath, subtree string) (*Result, error) {
 		// Files beginning with .syna- are private staging files created by the
 		// applier while it atomically materializes remote content. They are not
 		// workspace data and must never be uploaded by a hinted or full scan.
-		if subtree != "" && subtree != "." && isInternalStagingPath(subtree) {
+		if subtree != "" && subtree != "." && containsInternalStagingComponent(subtree) {
 			return result, nil
 		}
 		scanRoot := rootPath
@@ -148,6 +148,17 @@ func scan(rootPath, subtree string) (*Result, error) {
 
 func isInternalStagingPath(path string) bool {
 	return strings.HasPrefix(filepath.Base(path), ".syna-")
+}
+
+func containsInternalStagingComponent(path string) bool {
+	for _, component := range strings.FieldsFunc(filepath.Clean(path), func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if strings.HasPrefix(component, ".syna-") {
+			return true
+		}
+	}
+	return false
 }
 
 func toRelPath(path string) string {

@@ -788,19 +788,19 @@ var (
 )
 
 type websocketStream struct {
-	cancel   context.CancelFunc
-	conn     *websocket.Conn
-	messages chan protocol.WSMessage
-	errors   chan error
+	cancel context.CancelFunc
+	conn   *websocket.Conn
+	notify chan struct{}
+	errors chan error
 }
 
 func startWebsocketStream(ctx context.Context, ws *websocket.Conn) *websocketStream {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream := &websocketStream{
-		cancel:   cancel,
-		conn:     ws,
-		messages: make(chan protocol.WSMessage, 256),
-		errors:   make(chan error, 1),
+		cancel: cancel,
+		conn:   ws,
+		notify: make(chan struct{}, 1),
+		errors: make(chan error, 1),
 	}
 	_ = ws.SetReadDeadline(time.Now().Add(wsClientPongWait))
 	ws.SetPongHandler(func(string) error {
@@ -822,10 +822,11 @@ func startWebsocketStream(ctx context.Context, ws *websocket.Conn) *websocketStr
 				fail(err)
 				return
 			}
-			select {
-			case stream.messages <- msg:
-			case <-streamCtx.Done():
-				return
+			if msg.Type == "event" && msg.Event != nil {
+				select {
+				case stream.notify <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}()
@@ -874,10 +875,7 @@ func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketSt
 			return ctx.Err()
 		case err := <-stream.errors:
 			return err
-		case msg := <-stream.messages:
-			if msg.Type != "event" || msg.Event == nil {
-				continue
-			}
+		case <-stream.notify:
 			// Treat WebSocket events as notifications. HTTP catch-up is ordered,
 			// paginated, and retryable, whereas concurrent HTTP handlers can make
 			// raw fanout arrive out of sequence.
@@ -1182,6 +1180,12 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 }
 
 func (d *Daemon) consumeRemoteEvent(ctx context.Context, event protocol.EventRecord) error {
+	// Submissions are materialized locally before their server sequence can be
+	// consumed. Reapplying one later can overwrite a newer local edit made in
+	// that window; for our own events, only advance the ordered cursor.
+	if event.AuthorDeviceID == d.cfg.DeviceID {
+		return d.stateDB.AdvanceLastSeq(event.Seq)
+	}
 	if err := d.applyRemoteEvent(ctx, event); err != nil {
 		return err
 	}

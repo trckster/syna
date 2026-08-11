@@ -77,6 +77,28 @@ func TestConsumeNoOpLifecycleEventAdvancesCursor(t *testing.T) {
 	}
 }
 
+func TestConsumeOwnEventAdvancesCursorWithoutApplying(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	if err := d.consumeRemoteEvent(context.Background(), protocol.EventRecord{
+		Seq:            12,
+		RootID:         "unknown-root",
+		EventType:      protocol.EventRootAdd,
+		AuthorDeviceID: d.cfg.DeviceID,
+		PayloadBlob:    "deliberately-invalid",
+	}); err != nil {
+		t.Fatalf("consumeRemoteEvent own event: %v", err)
+	}
+	st, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq != 12 {
+		t.Fatalf("last server seq = %d want 12", st.LastServerSeq)
+	}
+}
+
 func TestRootForRemoveReportsUntrackedPath(t *testing.T) {
 	roots := []state.Root{
 		{
