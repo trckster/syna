@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"syna/internal/common/protocol"
 )
@@ -47,6 +48,12 @@ func scan(rootPath, subtree string) (*Result, error) {
 	result := &Result{}
 	if info.IsDir() {
 		result.RootKind = protocol.RootKindDir
+		// Files beginning with .syna- are private staging files created by the
+		// applier while it atomically materializes remote content. They are not
+		// workspace data and must never be uploaded by a hinted or full scan.
+		if subtree != "" && subtree != "." && containsInternalStagingComponent(subtree) {
+			return result, nil
+		}
 		scanRoot := rootPath
 		if subtree != "" && subtree != "." {
 			scanRoot = filepath.Join(rootPath, subtree)
@@ -69,9 +76,20 @@ func scan(rootPath, subtree string) (*Result, error) {
 		result.Entries = append(result.Entries, statEntry(toRelPath(subtree), scanRoot, info, protocol.RootKindDir, ""))
 		err = filepath.WalkDir(scanRoot, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				// A staging path can be renamed away between directory enumeration
+				// and lstat. It is outside the logical tree either way.
+				if isInternalStagingPath(path) {
+					return nil
+				}
 				return walkErr
 			}
 			if path == scanRoot {
+				return nil
+			}
+			if isInternalStagingPath(path) {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			info, err := d.Info()
@@ -126,6 +144,21 @@ func scan(rootPath, subtree string) (*Result, error) {
 		return a.RelPath < b.RelPath
 	})
 	return result, nil
+}
+
+func isInternalStagingPath(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), ".syna-")
+}
+
+func containsInternalStagingComponent(path string) bool {
+	for _, component := range strings.FieldsFunc(filepath.Clean(path), func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if strings.HasPrefix(component, ".syna-") {
+			return true
+		}
+	}
+	return false
 }
 
 func toRelPath(path string) string {

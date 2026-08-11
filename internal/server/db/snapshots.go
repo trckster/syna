@@ -19,11 +19,12 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 
 	var removedSeq sql.NullInt64
 	var latestSnapshotSeq sql.NullInt64
+	var createdSeq int64
 	err = tx.QueryRow(`
-		SELECT removed_seq, latest_snapshot_seq
+		SELECT removed_seq, latest_snapshot_seq, created_seq
 		FROM roots
 		WHERE workspace_id = ? AND root_id = ?
-	`, sess.WorkspaceID, req.RootID).Scan(&removedSeq, &latestSnapshotSeq)
+	`, sess.WorkspaceID, req.RootID).Scan(&removedSeq, &latestSnapshotSeq, &createdSeq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("unknown root")
 	}
@@ -32,6 +33,9 @@ func (db *DB) SaveSnapshot(sess *Session, req protocol.SnapshotSubmitRequest) er
 	}
 	if removedSeq.Valid {
 		return fmt.Errorf("root removed")
+	}
+	if req.BaseSeq < createdSeq {
+		return fmt.Errorf("snapshot predates current root incarnation")
 	}
 	if latestSnapshotSeq.Valid && req.BaseSeq < latestSnapshotSeq.Int64 {
 		return fmt.Errorf("stale snapshot")

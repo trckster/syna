@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"syna/internal/client/connector"
 	"syna/internal/common/protocol"
 )
 
@@ -88,6 +89,71 @@ func TestIntegrationRebootstrapKeepsNewerLocalEdit(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(rootDir1, "note.txt")); err != nil || string(got) != "local-edit\n" {
 		t.Fatalf("first device contents %q err=%v", string(got), err)
+	}
+}
+
+func TestIntegrationRebootstrapReplaysEventsAfterSnapshot(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	file1 := filepath.Join(rootDir1, "note.txt")
+	if err := os.WriteFile(file1, []byte("snapshot\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(snapshot): %v", err)
+	}
+	if err := first.AddRoot(context.Background(), rootDir1); err != nil {
+		t.Fatalf("first AddRoot: %v", err)
+	}
+
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	if err := os.WriteFile(file1, []byte("after-snapshot\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after snapshot): %v", err)
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel(first): %v", err)
+	}
+	if err := first.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+		t.Fatalf("first rescanRootHint: %v", err)
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second catch-up: %v", err)
+	}
+
+	target := filepath.Join(home2, "notes", "note.txt")
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("Remove(second target): %v", err)
+	}
+	if err := second.bootstrap(context.Background()); err != nil {
+		t.Fatalf("second re-bootstrap: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile(after re-bootstrap): %v", err)
+	}
+	if string(got) != "after-snapshot\n" {
+		t.Fatalf("re-bootstrap stopped at stale snapshot: %q", string(got))
 	}
 }
 
@@ -290,5 +356,41 @@ func TestStreamEventsKeepsHealthyConnectionAlive(t *testing.T) {
 	case <-errCh:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("stream did not stop after context cancel")
+	}
+}
+
+func TestStreamEventsReturnsCatchUpFailure(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/ws":
+			conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			_ = conn.WriteJSON(protocol.WSMessage{
+				Type:  "event",
+				Event: &protocol.EventRecord{Seq: 1},
+			})
+			<-r.Context().Done()
+		case "/v1/events":
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	d.conn = connector.New(server.URL)
+
+	ws, err := d.conn.DialWS(context.Background())
+	if err != nil {
+		t.Fatalf("DialWS: %v", err)
+	}
+	err = d.streamEvents(context.Background(), ws)
+	if err == nil || !strings.Contains(err.Error(), "http 500") {
+		t.Fatalf("stream error = %v want catch-up HTTP failure", err)
 	}
 }

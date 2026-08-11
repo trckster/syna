@@ -300,17 +300,13 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 	if err := d.configs.SaveKeyring(d.keyring); err != nil {
 		return nil, err
 	}
-	initialState := protocol.ConnectionLive
-	if session.CurrentSeq > 0 {
-		initialState = protocol.ConnectionNeedsBootstrap
-	}
 	if err := d.stateDB.SaveWorkspaceState(state.WorkspaceState{
 		ServerURL:        serverURL,
 		WorkspaceID:      workspaceID,
 		SessionToken:     session.Token,
 		SessionExpiresAt: session.ExpiresAt,
 		LastServerSeq:    0,
-		ConnectionState:  initialState,
+		ConnectionState:  protocol.ConnectionCatchingUp,
 	}); err != nil {
 		return nil, err
 	}
@@ -329,7 +325,6 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 			_ = d.stateDB.SetConnectionStateWithKind(protocol.ConnectionDegraded, protocol.IssueBootstrap, err.Error())
 			return nil, err
 		}
-		_ = d.stateDB.SetConnectionState(protocol.ConnectionLive, "")
 	}
 	d.intentionalDisconnect = false
 	d.startReconnectLoopLocked()
@@ -464,9 +459,11 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		Kind:        scan.RootKind,
 		HomeRelPath: homeRelPath,
 	}
-	if _, err := d.submitEvent(ctx, rootID, "", scan.RootKind, protocol.EventRootAdd, nil, rootAddPayload, nil); err != nil {
+	rootAddResp, err := d.submitEvent(ctx, rootID, "", scan.RootKind, protocol.EventRootAdd, nil, rootAddPayload, nil)
+	if err != nil {
 		return err
 	}
+	rootCreatedSeq := rootAddResp.AcceptedSeq
 
 	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan, progress, totals)
 	if err != nil {
@@ -474,6 +471,24 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 	}
 	if err := d.stateDB.ReplaceEntries(rootID, initialSync.Entries); err != nil {
 		return err
+	}
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return err
+	}
+	if _, err := d.activeRootAfterInitialSync(rootID, homeRelPath); err != nil {
+		return err
+	}
+	matched, remoteActive, verifyErr := d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+	if verifyErr != nil {
+		d.logger.Printf("could not verify root %s before snapshot publication: %v", rootID, verifyErr)
+	} else if !remoteActive {
+		return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	} else if !matched {
+		done, replaceErr := d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+		if !done {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+		}
+		return replaceErr
 	}
 	reportAddProgress(progress, AddProgress{
 		Stage:        "finalizing",
@@ -486,8 +501,45 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		DoneEntries:  totals.DoneEntries,
 		TotalEntries: totals.TotalEntries,
 	})
-	d.publishInitialSnapshot(ctx, rootID, initialSync)
-	d.addWatcherRoot(rootID, absPath)
+	publishErr := d.publishInitialSnapshot(ctx, rootID, initialSync)
+	if catchUpErr := d.bootstrapOrCatchUp(ctx); catchUpErr != nil {
+		d.logger.Printf("could not catch up root %s after snapshot publication: %v", rootID, catchUpErr)
+		if retryErr := d.bootstrapOrCatchUp(ctx); retryErr != nil {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+			return fmt.Errorf("catch up after initial sync: %v; retry: %w", catchUpErr, retryErr)
+		}
+	}
+	currentRoot, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
+	if err != nil {
+		return err
+	}
+	matched, remoteActive, verifyErr = d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+	if verifyErr != nil {
+		d.logger.Printf("could not verify root %s after snapshot publication: %v", rootID, verifyErr)
+		matched, remoteActive, verifyErr = d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+		if verifyErr != nil {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+			return fmt.Errorf("verify root after initial sync: %w", verifyErr)
+		}
+	}
+	if !remoteActive {
+		return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	if !matched {
+		done, replaceErr := d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+		if !done {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+		}
+		return replaceErr
+	}
+	if publishErr != nil {
+		d.logger.Printf("initial snapshot for root %s was not published: %v", rootID, publishErr)
+	}
+	if d.isRootStaged(rootID) {
+		d.enqueueRootRescan(rootID)
+		return fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	d.addWatcherRoot(rootID, currentRoot.TargetAbsPath)
 	reportAddProgress(progress, AddProgress{
 		Stage:        "done",
 		Message:      "sync complete",
@@ -500,6 +552,142 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		TotalEntries: totals.TotalEntries,
 	})
 	return nil
+}
+
+func (d *Daemon) activeRootAfterInitialSync(rootID, homeRelPath string) (*state.Root, error) {
+	root, err := d.stateDB.RootByID(rootID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		return nil, err
+	}
+	if root.State != protocol.RootStateActive {
+		return nil, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	return root, nil
+}
+
+func (d *Daemon) verifyRootIncarnation(ctx context.Context, rootID string, createdSeq int64) (matched, active bool, err error) {
+	remoteCreatedSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+	if err != nil || !active {
+		return false, active, err
+	}
+	return remoteCreatedSeq == createdSeq, true, nil
+}
+
+func (d *Daemon) remoteRootIncarnation(ctx context.Context, rootID string) (createdSeq int64, active bool, err error) {
+	bootstrap, err := d.conn.Bootstrap(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, remoteRoot := range bootstrap.Roots {
+		if remoteRoot.RootID != rootID {
+			continue
+		}
+		return remoteRoot.CreatedSeq, true, nil
+	}
+	return 0, false, nil
+}
+
+func (d *Daemon) stageReplacedRootAfterInitialSync(ctx context.Context, rootID, homeRelPath string) (bool, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		beforeSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			return true, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		// Stage before consuming the replacement lifecycle so a resync-required
+		// bootstrap cannot apply the new incarnation over the old local tree.
+		d.markStagedRoot(rootID)
+		if err := d.bootstrapOrCatchUp(ctx); err != nil {
+			return false, err
+		}
+		afterSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			continue
+		}
+		if beforeSeq != afterSeq {
+			continue
+		}
+		if _, err := d.activeRootAfterInitialSync(rootID, homeRelPath); err != nil {
+			return true, err
+		}
+		d.enqueueRootRescan(rootID)
+		return true, fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	return false, fmt.Errorf("root %q kept changing during initial sync", homeRelPath)
+}
+
+func (d *Daemon) scheduleInitialRootFinalization(rootID, homeRelPath string, createdSeq int64) {
+	ctx := d.runCtx
+	if ctx == nil {
+		return
+	}
+	go func() {
+		delay := time.Second
+		for {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			d.syncMu.Lock()
+			done, err := d.retryInitialRootFinalization(ctx, rootID, homeRelPath, createdSeq)
+			d.syncMu.Unlock()
+			if done {
+				if err != nil && !errors.Is(err, context.Canceled) {
+					d.logger.Printf("stopped finalizing root %s: %v", rootID, err)
+				}
+				return
+			}
+			if err != nil && !errors.Is(err, context.Canceled) {
+				d.logger.Printf("retry finalizing root %s: %v", rootID, err)
+			}
+			if delay < 30*time.Second {
+				delay *= 2
+			}
+		}
+	}()
+}
+
+func (d *Daemon) retryInitialRootFinalization(ctx context.Context, rootID, homeRelPath string, createdSeq int64) (bool, error) {
+	d.mu.Lock()
+	connected := d.conn != nil && d.keys != nil && d.cfg.WorkspaceID != ""
+	d.mu.Unlock()
+	if !connected {
+		return false, errors.New("not connected")
+	}
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return false, err
+	}
+	root, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
+	if err != nil {
+		return true, err
+	}
+	matched, active, err := d.verifyRootIncarnation(ctx, rootID, createdSeq)
+	if err != nil {
+		return false, err
+	}
+	if !active {
+		return true, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	if !matched {
+		return d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+	}
+	if d.isRootStaged(rootID) {
+		d.enqueueRootRescan(rootID)
+		return true, fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	d.addWatcherRoot(rootID, root.TargetAbsPath)
+	return true, nil
 }
 
 func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
@@ -525,7 +713,7 @@ func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
 	if _, err := d.submitEvent(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
 		return err
 	}
-	return d.markRootRemoved(*root)
+	return d.bootstrapOrCatchUp(ctx)
 }
 
 func rootForRemove(roots []state.Root, absPath, homeRelPath string) (*state.Root, error) {
@@ -667,7 +855,6 @@ func (d *Daemon) submitEvent(ctx context.Context, rootID, pathID string, rootKin
 		}
 		return nil, err
 	}
-	_ = d.stateDB.AdvanceLastSeq(resp.AcceptedSeq)
 	return resp, nil
 }
 
@@ -729,9 +916,29 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 	if err := d.ensureSession(ctx); err != nil {
 		return markLifecycle(protocol.IssueAuth, err)
 	}
+	d.mu.Lock()
+	conn = d.conn
+	d.mu.Unlock()
+	if conn == nil {
+		return markLifecycle(protocol.IssueAuth, errors.New("session connector is unavailable"))
+	}
 	if err := d.stateDB.SetConnectionState(protocol.ConnectionCatchingUp, ""); err != nil {
 		return err
 	}
+
+	// The server installs the subscription before completing the WebSocket
+	// handshake. Open it before catch-up so events accepted after the HTTP
+	// snapshot are buffered instead of falling into a subscription gap.
+	ws, err := conn.DialWS(ctx)
+	if err != nil {
+		return markLifecycle(protocol.IssueTransport, err)
+	}
+	stream := startWebsocketStream(ctx, ws)
+	defer stream.Close()
+
+	// Pending rescans represent local changes made while offline. Flush them
+	// before applying remote catch-up so path-head conflicts can preserve the
+	// offline bytes instead of letting a remote apply overwrite them first.
 	if err := d.flushPendingOps(ctx); err != nil {
 		return markLifecycle(protocol.IssueTransport, err)
 	}
@@ -744,6 +951,15 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 	if err := d.reconcileActiveRoots(ctx); err != nil {
 		return markLifecycle(protocol.IssueTransport, err)
 	}
+	// Reconcile can submit local events and can run long enough for peers to
+	// submit more. Catch up once more while the WebSocket buffers everything
+	// accepted after this second HTTP snapshot.
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return markLifecycle(protocol.IssueBootstrap, err)
+	}
+	if err := stream.Err(); err != nil {
+		return markLifecycle(protocol.IssueTransport, err)
+	}
 	if err := d.stateDB.SetConnectionState(protocol.ConnectionLive, ""); err != nil {
 		return err
 	}
@@ -752,12 +968,7 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 
 	d.setStreamingLive(true)
 	defer d.setStreamingLive(false)
-	ws, err := conn.DialWS(ctx)
-	if err != nil {
-		return markLifecycle(protocol.IssueTransport, err)
-	}
-	defer ws.Close()
-	return d.streamEvents(ctx, ws)
+	return d.consumeWebsocketStream(ctx, stream)
 }
 
 var (
@@ -766,60 +977,136 @@ var (
 	wsClientWriteWait = 10 * time.Second
 )
 
-func (d *Daemon) streamEvents(ctx context.Context, ws *websocket.Conn) error {
+type websocketStream struct {
+	cancel context.CancelFunc
+	conn   *websocket.Conn
+	notify chan struct{}
+	errors chan error
+}
+
+func startWebsocketStream(ctx context.Context, ws *websocket.Conn) *websocketStream {
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream := &websocketStream{
+		cancel: cancel,
+		conn:   ws,
+		notify: make(chan struct{}, 1),
+		errors: make(chan error, 1),
+	}
 	_ = ws.SetReadDeadline(time.Now().Add(wsClientPongWait))
 	ws.SetPongHandler(func(string) error {
 		return ws.SetReadDeadline(time.Now().Add(wsClientPongWait))
 	})
-	pingCtx, cancelPing := context.WithCancel(ctx)
-	defer cancelPing()
+
+	fail := func(err error) {
+		select {
+		case stream.errors <- err:
+		default:
+		}
+		cancel()
+		_ = ws.Close()
+	}
+	go func() {
+		for {
+			var msg protocol.WSMessage
+			if err := ws.ReadJSON(&msg); err != nil {
+				fail(err)
+				return
+			}
+			if msg.Type == "event" && msg.Event != nil {
+				select {
+				case stream.notify <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(wsClientPingEvery)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-pingCtx.Done():
-				_ = ws.Close()
+			case <-streamCtx.Done():
 				return
 			case <-ticker.C:
 				if err := ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(wsClientWriteWait)); err != nil {
-					_ = ws.Close()
+					fail(err)
 					return
 				}
 			}
 		}
 	}()
+	return stream
+}
+
+func (s *websocketStream) Close() {
+	s.cancel()
+	_ = s.conn.Close()
+}
+
+func (s *websocketStream) Err() error {
+	select {
+	case err := <-s.errors:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (d *Daemon) streamEvents(ctx context.Context, ws *websocket.Conn) error {
+	stream := startWebsocketStream(ctx, ws)
+	defer stream.Close()
+	return d.consumeWebsocketStream(ctx, stream)
+}
+
+func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketStream) error {
 	for {
-		var msg protocol.WSMessage
-		if err := ws.ReadJSON(&msg); err != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-stream.errors:
 			return err
-		}
-		if msg.Type == "event" && msg.Event != nil {
-			if err := d.applyRemoteEvent(ctx, *msg.Event); err != nil {
-				d.logger.Printf("apply remote event: %v", err)
+		case <-stream.notify:
+			// Treat WebSocket events as notifications. HTTP catch-up is ordered,
+			// paginated, and retryable, whereas concurrent HTTP handlers can make
+			// raw fanout arrive out of sequence.
+			d.syncMu.Lock()
+			err := d.bootstrapOrCatchUp(ctx)
+			d.syncMu.Unlock()
+			if err != nil {
+				return err
 			}
 		}
 	}
 }
 
 func (d *Daemon) bootstrapOrCatchUp(ctx context.Context) error {
-	st, err := d.stateDB.LoadWorkspaceState()
-	if err != nil {
-		return err
-	}
-	resp, apiErr, err := d.conn.FetchEvents(ctx, st.LastServerSeq, 1000)
-	if err != nil && apiErr != nil && apiErr.Code == "resync_required" {
-		return d.bootstrap(ctx)
-	}
-	if err != nil {
-		return err
-	}
-	for _, event := range resp.Events {
-		if err := d.applyRemoteEvent(ctx, event); err != nil {
+	for {
+		st, err := d.stateDB.LoadWorkspaceState()
+		if err != nil {
 			return err
 		}
+		resp, apiErr, err := d.conn.FetchEvents(ctx, st.LastServerSeq, 1000)
+		if err != nil && apiErr != nil && apiErr.Code == "resync_required" {
+			return d.bootstrap(ctx)
+		}
+		if err != nil {
+			return err
+		}
+		for _, event := range resp.Events {
+			if err := d.consumeRemoteEvent(ctx, event); err != nil {
+				return err
+			}
+		}
+		if len(resp.Events) == 0 {
+			if st.LastServerSeq < resp.CurrentSeq {
+				return fmt.Errorf("event catch-up made no progress at sequence %d of %d", st.LastServerSeq, resp.CurrentSeq)
+			}
+			return nil
+		}
+		if resp.Events[len(resp.Events)-1].Seq >= resp.CurrentSeq {
+			return nil
+		}
 	}
-	return d.stateDB.AdvanceLastSeq(resp.CurrentSeq)
 }
 
 func (d *Daemon) bootstrap(ctx context.Context) error {
@@ -827,7 +1114,9 @@ func (d *Daemon) bootstrap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	remoteRootIDs := make(map[string]struct{}, len(resp.Roots))
 	for _, root := range resp.Roots {
+		remoteRootIDs[root.RootID] = struct{}{}
 		if _, err := d.ensureRootFromDescriptor(root); err != nil {
 			var integrityErr *applier.IntegrityError
 			if errors.As(err, &integrityErr) {
@@ -853,14 +1142,26 @@ func (d *Daemon) bootstrap(ctx context.Context) error {
 			}
 		}
 	}
-	events, _, err := d.conn.FetchEvents(ctx, resp.BootstrapAfterSeq, 1000)
+	localRoots, err := d.stateDB.ListRoots()
 	if err != nil {
 		return err
 	}
-	for _, event := range events.Events {
-		if err := d.applyRemoteEvent(ctx, event); err != nil {
+	for _, root := range localRoots {
+		if root.State == protocol.RootStateRemoved {
+			continue
+		}
+		if _, active := remoteRootIDs[root.RootID]; active {
+			continue
+		}
+		if err := d.markRootRemoved(root); err != nil {
 			return err
 		}
+	}
+	if err := d.stateDB.ResetLastSeq(resp.BootstrapAfterSeq); err != nil {
+		return err
+	}
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return err
 	}
 	roots, _ := d.stateDB.ListRoots()
 	for _, root := range roots {
@@ -868,7 +1169,7 @@ func (d *Daemon) bootstrap(ctx context.Context) error {
 			d.addWatcherRoot(root.RootID, root.TargetAbsPath)
 		}
 	}
-	return d.stateDB.AdvanceLastSeq(resp.CurrentSeq)
+	return nil
 }
 
 func (d *Daemon) ensureRootFromDescriptor(root protocol.BootstrapRoot) (bool, error) {
@@ -1025,7 +1326,7 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 			var integrityErr *applier.IntegrityError
 			if errors.As(err, &integrityErr) {
 				d.logRemoteIntegrityError(event, integrityErr)
-				return d.stateDB.AdvanceLastSeq(event.Seq)
+				return nil
 			}
 			return err
 		}
@@ -1047,7 +1348,7 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 		if err := d.markRootRemoved(*root); err != nil {
 			return err
 		}
-		return d.stateDB.AdvanceLastSeq(event.Seq)
+		return nil
 	default:
 		if root == nil || root.State != protocol.RootStateActive {
 			return nil
@@ -1057,15 +1358,71 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 			var integrityErr *applier.IntegrityError
 			if errors.As(err, &integrityErr) {
 				d.logRemoteIntegrityError(event, integrityErr)
-				return d.stateDB.AdvanceLastSeq(event.Seq)
+				return nil
 			}
 			return err
 		}
 		if staged && d.isStreamingLive() {
 			d.enqueueRootRescan(root.RootID)
 		}
-		return d.stateDB.AdvanceLastSeq(event.Seq)
+		return nil
 	}
+}
+
+func (d *Daemon) consumeRemoteEvent(ctx context.Context, event protocol.EventRecord) error {
+	// Content submissions are normally materialized locally before their server
+	// sequence can be consumed. Reapplying one later can overwrite a newer local
+	// edit made in that window. Author identity alone is not enough, though:
+	// bootstrap reconstruction and root removal can encounter our events without
+	// their effects being present locally.
+	if event.AuthorDeviceID == d.cfg.DeviceID {
+		materialized, err := d.eventMaterializedLocally(event)
+		if err != nil {
+			return err
+		}
+		if materialized {
+			return d.stateDB.AdvanceLastSeq(event.Seq)
+		}
+	}
+	if err := d.applyRemoteEvent(ctx, event); err != nil {
+		return err
+	}
+	return d.stateDB.AdvanceLastSeq(event.Seq)
+}
+
+func (d *Daemon) eventMaterializedLocally(event protocol.EventRecord) (bool, error) {
+	root, err := d.stateDB.RootByID(event.RootID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	switch event.EventType {
+	case protocol.EventRootAdd:
+		// An active root is created locally before root_add is submitted. A
+		// removed row may instead be the result of replaying an earlier
+		// remove/add lifecycle, so it must be reactivated by this event.
+		return root != nil && root.State == protocol.RootStateActive, nil
+	case protocol.EventRootRemove:
+		return root == nil || root.State == protocol.RootStateRemoved, nil
+	}
+	if root == nil || root.State != protocol.RootStateActive {
+		return true, nil
+	}
+	if root.LatestSnapshotSeq >= event.Seq {
+		return true, nil
+	}
+	if event.PathID == nil {
+		return false, nil
+	}
+	entries, err := d.stateDB.EntriesForRoot(event.RootID)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.PathID == *event.PathID && entry.CurrentSeq >= event.Seq {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (d *Daemon) watchLoop(ctx context.Context) {
@@ -1199,7 +1556,19 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			baseSeq = old.CurrentSeq
 		}
 		if item.Kind == protocol.RootKindDir {
-			if ok && !old.Deleted && old.Kind == protocol.RootKindDir && old.Mode == item.Mode && old.MTimeNS == item.MTimeNS {
+			if ok && !old.Deleted && old.Kind == protocol.RootKindDir && old.Mode == item.Mode {
+				// Child creation, replacement, and deletion all change the parent
+				// directory mtime. Those child events already describe the logical
+				// change, so publishing another dir_put creates feedback between
+				// devices. Keep the local scan baseline current without changing the
+				// server path head; existing directories only need an event for a
+				// meaningful metadata change such as chmod.
+				if old.MTimeNS != item.MTimeNS {
+					old.MTimeNS = item.MTimeNS
+					if err := d.stateDB.UpsertEntry(old); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventDirPut, &baseSeq, protocol.DirPutPayload{
@@ -1288,7 +1657,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 		d.clearStagedRoot(rootID)
 	}
 	d.addWatcherRoot(rootID, root.TargetAbsPath)
-	return nil
+	return d.bootstrapOrCatchUp(ctx)
 }
 
 func (d *Daemon) applyCurrentRemoteHead(ctx context.Context, seq int64) error {
@@ -1344,7 +1713,7 @@ func (d *Daemon) handleDeletedRoot(ctx context.Context, root state.Root, queueRe
 		}
 		return err
 	}
-	return d.markRootRemoved(root)
+	return d.bootstrapOrCatchUp(ctx)
 }
 
 func (d *Daemon) markRootRemoved(root state.Root) error {

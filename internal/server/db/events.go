@@ -221,20 +221,30 @@ func (e *PathHeadMismatchError) Error() string {
 }
 
 func (db *DB) FetchEvents(workspaceID string, afterSeq int64, limit int) ([]protocol.EventRecord, int64, error) {
-	floor, err := db.RetainedFloor(workspaceID)
+	tx, err := db.Begin(context.Background())
 	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var floor, currentSeq int64
+	if err := tx.QueryRow(`
+		SELECT retained_floor_seq, current_seq
+		FROM workspaces
+		WHERE workspace_id = ?
+	`, workspaceID).Scan(&floor, &currentSeq); err != nil {
 		return nil, 0, err
 	}
 	if afterSeq < floor {
 		return nil, floor, &ResyncRequiredError{RetainedFloorSeq: floor}
 	}
-	rows, err := db.SQL.Query(`
+	rows, err := tx.Query(`
 		SELECT seq, root_id, path_id, event_type, base_seq, author_device_id, payload_blob, created_at
 		FROM events
-		WHERE workspace_id = ? AND seq > ?
+		WHERE workspace_id = ? AND seq > ? AND seq <= ?
 		ORDER BY seq ASC
 		LIMIT ?
-	`, workspaceID, afterSeq, limit)
+	`, workspaceID, afterSeq, currentSeq, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -262,14 +272,13 @@ func (db *DB) FetchEvents(workspaceID string, afterSeq int64, limit int) ([]prot
 	}
 	rows.Close()
 	for i := range events {
-		refs, err := db.eventRefs(events[i].Seq)
+		refs, err := eventRefs(tx, events[i].Seq)
 		if err != nil {
 			return nil, 0, err
 		}
 		events[i].ObjectRefs = refs
 	}
-	currentSeq, err := db.CurrentSeq(workspaceID)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, 0, err
 	}
 	return events, currentSeq, nil
@@ -284,7 +293,13 @@ func (e *ResyncRequiredError) Error() string {
 }
 
 func (db *DB) eventRefs(seq int64) ([]string, error) {
-	rows, err := db.SQL.Query(`SELECT object_id FROM event_object_refs WHERE event_seq = ? ORDER BY object_id ASC`, seq)
+	return eventRefs(db.SQL, seq)
+}
+
+func eventRefs(queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}, seq int64) ([]string, error) {
+	rows, err := queryer.Query(`SELECT object_id FROM event_object_refs WHERE event_seq = ? ORDER BY object_id ASC`, seq)
 	if err != nil {
 		return nil, err
 	}

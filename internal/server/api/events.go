@@ -77,6 +77,11 @@ func (a *API) handleEventSubmit(w http.ResponseWriter, r *http.Request, sess *db
 		writeError(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
+	// SubmitEvent assigns the global sequence in SQLite. Keep publication in
+	// the same critical section so concurrent handlers cannot fan out a newer
+	// event before an older one.
+	a.eventMu.Lock()
+	defer a.eventMu.Unlock()
 	result, err := a.db.SubmitEvent(sess, req)
 	if err != nil {
 		var mismatch *db.PathHeadMismatchError

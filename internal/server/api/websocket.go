@@ -24,19 +24,22 @@ func (a *API) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "")
 		return
 	}
+	sub, err := a.hub.Subscribe(sess.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "websocket_limit_reached", "workspace websocket client limit reached")
+		return
+	}
+	defer a.hub.Unsubscribe(sess.WorkspaceID, sub)
+
+	// Subscribe before completing the upgrade. Once DialWS returns, the client
+	// can safely catch up over HTTP knowing that every later event is already
+	// buffered by this subscription.
 	upgrader := websocket.Upgrader{CheckOrigin: a.checkWSOrigin}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	defer conn.Close()
-
-	sub, err := a.hub.Subscribe(sess.WorkspaceID)
-	if err != nil {
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "workspace websocket client limit reached"), time.Now().Add(wsWriteWait))
-		return
-	}
-	defer a.hub.Unsubscribe(sess.WorkspaceID, sub)
+	defer func() { _ = conn.Close() }()
 	conn.SetReadLimit(protocol.MaxWSMessageBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	conn.SetPongHandler(func(string) error {

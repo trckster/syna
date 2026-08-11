@@ -312,6 +312,8 @@ Behavior:
 
 - after auth, the socket receives only newly accepted events
 - backlog catch-up is done through `GET /v1/events`, not through the WebSocket
+- the server registers the subscription before completing the WebSocket handshake
+- clients subscribe first, perform paginated HTTP catch-up, and treat event messages as notifications to catch up again
 
 Server messages:
 

@@ -241,6 +241,17 @@ func (db *DB) SetConnectionStateWithKind(state protocol.ConnectionState, lastErr
 }
 
 func (db *DB) AdvanceLastSeq(seq int64) error {
+	_, err := db.SQL.Exec(`
+		UPDATE workspace_state
+		SET last_server_seq = MAX(last_server_seq, ?)
+		WHERE singleton = 1
+	`, seq)
+	return err
+}
+
+// ResetLastSeq moves the cursor to the reconstruction point represented by a
+// freshly applied bootstrap. Normal event consumption must use AdvanceLastSeq.
+func (db *DB) ResetLastSeq(seq int64) error {
 	_, err := db.SQL.Exec(`UPDATE workspace_state SET last_server_seq = ? WHERE singleton = 1`, seq)
 	return err
 }
