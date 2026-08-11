@@ -2,7 +2,7 @@
 
 Run this checklist before publishing a server or client build.
 
-1. Build and test with Go `1.25.12` or a newer fixed `1.25.x` patch release.
+1. Build and test with Go `1.26.5` or a newer fixed `1.26.x` patch release.
 2. Run `go test ./...`.
 3. Run `go vet ./...`.
 4. Run `govulncheck ./...` and block the release on any reachable vulnerability.
@@ -30,7 +30,7 @@ Run this checklist before publishing a server or client build.
     client users to build from source.
 16. Verify the one-line client installer resolves the latest version and installs
     the matching client binary:
-    `curl -fsSL https://raw.githubusercontent.com/trckster/syna/main/scripts/install.sh | sh`
+    `curl -fsSL https://raw.githubusercontent.com/trckster/syna/master/scripts/install.sh | sh`
 17. Verify `SYNA_PUBLIC_BASE_URL` is `https://...` in production and that `SYNA_ALLOW_HTTP` is not enabled.
 18. Verify the backend is reachable only through an HTTPS reverse proxy and the raw backend port is not publicly exposed.
 19. Verify object-store disk usage, free space, and file-descriptor limits are within operating thresholds before rollout.
