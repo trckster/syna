@@ -24,7 +24,7 @@ func TestGCDeletesZeroRefObjectFilesAfterRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestPurgeWorkspaceDeletesOnlyTargetWorkspaceData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestRecoverPurgeStagingRestoresReferencedAndDeletesOrphanedObjects(t *testi
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}

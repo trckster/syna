@@ -118,14 +118,10 @@ func PurgeWorkspace(database *db.DB, store *objectstore.Store, dataDir, workspac
 	if err := database.CompactAfterPurge(); err != nil {
 		return err
 	}
-	fmt.Fprintf(output, "workspace_id: %s\n", workspaceID)
-	fmt.Fprintf(output, "deleted_devices: %d\n", result.Devices)
-	fmt.Fprintf(output, "deleted_sessions: %d\n", result.Sessions)
-	fmt.Fprintf(output, "deleted_roots: %d\n", result.Roots)
-	fmt.Fprintf(output, "deleted_events: %d\n", result.Events)
-	fmt.Fprintf(output, "deleted_snapshots: %d\n", result.Snapshots)
-	fmt.Fprintf(output, "deleted_objects: %d\n", len(result.Objects))
-	fmt.Fprintf(output, "deleted_bytes: %d\n", deletedBytes)
+	if _, err := fmt.Fprintf(output, "workspace_id: %s\ndeleted_devices: %d\ndeleted_sessions: %d\ndeleted_roots: %d\ndeleted_events: %d\ndeleted_snapshots: %d\ndeleted_objects: %d\ndeleted_bytes: %d\n",
+		workspaceID, result.Devices, result.Sessions, result.Roots, result.Events, result.Snapshots, len(result.Objects), deletedBytes); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -267,8 +263,11 @@ func syncDir(path string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 func validWorkspaceID(workspaceID string) bool {
@@ -276,7 +275,7 @@ func validWorkspaceID(workspaceID string) bool {
 		return false
 	}
 	for _, char := range workspaceID {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
 			return false
 		}
 	}

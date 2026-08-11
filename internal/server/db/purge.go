@@ -39,7 +39,7 @@ func (db *DB) WorkspacePurgeObjects(workspaceID string) ([]PurgeObject, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var objects []PurgeObject
 	for rows.Next() {
 		var object PurgeObject
@@ -59,7 +59,7 @@ func (db *DB) PurgeWorkspace(workspaceID string, candidates []PurgeObject, now t
 	if err != nil {
 		return PurgeResult{}, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var exists int
 	if err := tx.QueryRow(`SELECT 1 FROM workspaces WHERE workspace_id = ?`, workspaceID).Scan(&exists); err != nil {

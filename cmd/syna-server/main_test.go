@@ -153,7 +153,7 @@ func TestServerProcessPurgesWorkspaceByPassedID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen database: %v", err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	if _, err := database.WorkspacePubKey(workspaceID); err == nil {
 		t.Fatal("workspace still exists after purge")
 	}

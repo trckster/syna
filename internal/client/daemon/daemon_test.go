@@ -182,7 +182,7 @@ func TestNewFinishesInterruptedPurgedWorkspaceTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New after interrupted transition: %v", err)
 	}
-	defer recovered.Close()
+	defer func() { _ = recovered.Close() }()
 	if recovered.cfg.ServerURL != "" || recovered.cfg.WorkspaceID != "" || recovered.conn != nil {
 		t.Fatalf("purged config was not reconciled: %+v", recovered.cfg)
 	}

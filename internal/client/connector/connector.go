@@ -191,7 +191,7 @@ func (c *Client) DialWS(ctx context.Context) (*websocket.Conn, error) {
 	header.Set("Authorization", "Bearer "+c.Token)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
 	if err != nil && resp != nil {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		return nil, responseError("open websocket", resp)
 	}
 	return conn, err

@@ -48,7 +48,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(stderr, err)
 		}
-		defer dataLock.Close()
+		defer func() { _ = dataLock.Close() }()
 	}
 	database, err := db.Open(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
@@ -138,7 +138,7 @@ func runServer(cfg servercfg.Config, database *db.DB, output io.Writer) error {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: syna-server <serve|migrate|gc|stats|doctor|purge-workspace <workspace-id>|version>")
+	_, _ = fmt.Fprintln(w, "usage: syna-server <serve|migrate|gc|stats|doctor|purge-workspace <workspace-id>|version>")
 }
 
 func exitErr(stderr io.Writer, err error) int {
