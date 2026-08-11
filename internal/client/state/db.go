@@ -240,6 +240,11 @@ func (db *DB) SetConnectionStateWithKind(state protocol.ConnectionState, lastErr
 	return err
 }
 
+func (db *DB) ClearSession() error {
+	_, err := db.SQL.Exec(`UPDATE workspace_state SET session_token = NULL, session_expires_at = NULL WHERE singleton = 1`)
+	return err
+}
+
 func (db *DB) AdvanceLastSeq(seq int64) error {
 	_, err := db.SQL.Exec(`
 		UPDATE workspace_state
@@ -257,6 +262,14 @@ func (db *DB) ResetLastSeq(seq int64) error {
 }
 
 func (db *DB) ClearWorkspace() error {
+	return db.clearWorkspace(protocol.ConnectionDisconnected, "", "")
+}
+
+func (db *DB) ClearPurgedWorkspace() error {
+	return db.clearWorkspace(protocol.ConnectionWorkspacePurged, protocol.IssueWorkspaceGone, "workspace was purged from the server")
+}
+
+func (db *DB) clearWorkspace(connection protocol.ConnectionState, issue protocol.DaemonIssueKind, message string) error {
 	tx, err := db.SQL.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
@@ -268,10 +281,16 @@ func (db *DB) ClearWorkspace() error {
 		`DELETE FROM pending_ops`,
 		`DELETE FROM ignore_events`,
 		`DELETE FROM warnings`,
-		`UPDATE workspace_state SET server_url = NULL, workspace_id = NULL, session_token = NULL, session_expires_at = NULL, last_server_seq = 0, connection_state = 'disconnected', last_error_kind = NULL, last_error = NULL WHERE singleton = 1`,
+		`UPDATE workspace_state SET server_url = NULL, workspace_id = NULL, session_token = NULL, session_expires_at = NULL, last_server_seq = 0, connection_state = ?, last_error_kind = ?, last_error = ? WHERE singleton = 1`,
 	} {
-		if _, err := tx.Exec(stmt); err != nil {
-			return err
+		var execErr error
+		if strings.HasPrefix(stmt, "UPDATE workspace_state") {
+			_, execErr = tx.Exec(stmt, string(connection), nullString(string(issue)), nullString(message))
+		} else {
+			_, execErr = tx.Exec(stmt)
+		}
+		if execErr != nil {
+			return execErr
 		}
 	}
 	return tx.Commit()

@@ -2,11 +2,16 @@ package daemon
 
 import (
 	"context"
+	"io"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"syna/internal/client/configstore"
 	"syna/internal/client/connector"
 	"syna/internal/client/state"
 	commoncrypto "syna/internal/common/crypto"
@@ -29,6 +34,171 @@ func TestMergeRescanHints(t *testing.T) {
 		if got := mergeRescanHints(tc.current, tc.next); got != tc.want {
 			t.Fatalf("mergeRescanHints(%q, %q) = %q want %q", tc.current, tc.next, got, tc.want)
 		}
+	}
+}
+
+func TestHandlePurgedWorkspaceClearsSyncStateButRetainsKey(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	rootPath := filepath.Join(t.TempDir(), "kept-files")
+	if err := os.MkdirAll(rootPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	keptFile := filepath.Join(rootPath, "notes.txt")
+	if err := os.WriteFile(keptFile, []byte("keep me"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	d.cfg.ServerURL = "https://syna.example"
+	d.cfg.WorkspaceID = strings.Repeat("a", 32)
+	d.keyring = configstore.Keyring{
+		ServerURL:    d.cfg.ServerURL,
+		WorkspaceID:  d.cfg.WorkspaceID,
+		WorkspaceKey: "syna1-retained",
+	}
+	if err := d.configs.SaveConfig(d.cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if err := d.configs.SaveKeyring(d.keyring); err != nil {
+		t.Fatalf("SaveKeyring: %v", err)
+	}
+	if err := d.stateDB.UpsertRoot(state.Root{
+		RootID:        "root-1",
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   "kept-files",
+		TargetAbsPath: rootPath,
+		State:         protocol.RootStateActive,
+	}); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+
+	if err := d.handlePurgedWorkspace(); err != nil {
+		t.Fatalf("handlePurgedWorkspace: %v", err)
+	}
+	if body, err := os.ReadFile(keptFile); err != nil || string(body) != "keep me" {
+		t.Fatalf("local file changed: body=%q err=%v", body, err)
+	}
+	keyring, err := d.configs.LoadKeyring()
+	if err != nil {
+		t.Fatalf("LoadKeyring: %v", err)
+	}
+	if keyring.WorkspaceKey != "syna1-retained" {
+		t.Fatalf("recovery key = %q", keyring.WorkspaceKey)
+	}
+	status, err := d.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Connection != protocol.ConnectionWorkspacePurged || status.LastErrorKind != protocol.IssueWorkspaceGone {
+		t.Fatalf("unexpected purged status: %+v", status)
+	}
+	if len(status.TrackedRoots) != 0 || status.ServerURL != "" || status.WorkspaceID != "" {
+		t.Fatalf("sync association was retained: %+v", status)
+	}
+}
+
+func TestHandlePurgedWorkspaceRetriesAfterConfigPersistenceFailure(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	d.cfg.ServerURL = "https://syna.example"
+	d.cfg.WorkspaceID = strings.Repeat("a", 32)
+	if err := d.configs.SaveConfig(d.cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	backup := d.paths.ConfigFile + ".backup"
+	if err := os.Rename(d.paths.ConfigFile, backup); err != nil {
+		t.Fatalf("rename config: %v", err)
+	}
+	if err := os.Mkdir(d.paths.ConfigFile, 0o700); err != nil {
+		t.Fatalf("mkdir at config path: %v", err)
+	}
+
+	if err := d.handlePurgedWorkspace(); err == nil {
+		t.Fatal("expected config persistence failure")
+	}
+	workspaceState, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if workspaceState.ConnectionState != protocol.ConnectionWorkspacePurged {
+		t.Fatalf("terminal state was not durably recorded: %+v", workspaceState)
+	}
+	if d.cfg.ServerURL == "" || d.cfg.WorkspaceID == "" {
+		t.Fatalf("in-memory config changed before persistence succeeded: %+v", d.cfg)
+	}
+	if err := os.Remove(d.paths.ConfigFile); err != nil {
+		t.Fatalf("remove blocking config directory: %v", err)
+	}
+	if err := os.Rename(backup, d.paths.ConfigFile); err != nil {
+		t.Fatalf("restore config: %v", err)
+	}
+	if err := d.handlePurgedWorkspace(); err != nil {
+		t.Fatalf("retry handlePurgedWorkspace: %v", err)
+	}
+	if d.cfg.ServerURL != "" || d.cfg.WorkspaceID != "" {
+		t.Fatalf("config was not cleared on retry: %+v", d.cfg)
+	}
+}
+
+func TestDiscardRejectedCachedSessionOnlyRetriesCachedToken(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	unauthorized := &connector.HTTPError{StatusCode: http.StatusUnauthorized, Code: "unauthorized"}
+	workspaceState, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	workspaceState.SessionToken = "cached-token"
+	workspaceState.SessionExpiresAt = time.Now().Add(time.Hour)
+	if err := d.stateDB.SaveWorkspaceState(workspaceState); err != nil {
+		t.Fatalf("SaveWorkspaceState: %v", err)
+	}
+	discarded, err := d.discardRejectedCachedSession(unauthorized)
+	if err != nil || !discarded {
+		t.Fatalf("discard cached session = %t err=%v", discarded, err)
+	}
+	discarded, err = d.discardRejectedCachedSession(unauthorized)
+	if err != nil || discarded {
+		t.Fatalf("fresh auth 401 should not fast-retry: discarded=%t err=%v", discarded, err)
+	}
+}
+
+func TestNewFinishesInterruptedPurgedWorkspaceTransition(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	d.cfg.ServerURL = "https://syna.example"
+	d.cfg.WorkspaceID = strings.Repeat("a", 32)
+	if err := d.configs.SaveConfig(d.cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if err := d.stateDB.ClearPurgedWorkspace(); err != nil {
+		t.Fatalf("ClearPurgedWorkspace: %v", err)
+	}
+	paths := d.paths
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	recovered, err := New(paths, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New after interrupted transition: %v", err)
+	}
+	defer recovered.Close()
+	if recovered.cfg.ServerURL != "" || recovered.cfg.WorkspaceID != "" || recovered.conn != nil {
+		t.Fatalf("purged config was not reconciled: %+v", recovered.cfg)
+	}
+}
+
+func TestConnectRejectsWhilePurgedTransitionIsPending(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	d.purgeTransition = true
+	_, err := d.Connect(context.Background(), ConnectRequest{
+		ServerURL:   "https://syna.example",
+		RecoveryKey: "syna1-unused",
+		Recreate:    true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "still being finalized") {
+		t.Fatalf("Connect error = %v", err)
 	}
 }
 

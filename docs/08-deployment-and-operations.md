@@ -155,7 +155,8 @@ Restore procedure:
 
 1. restore `/srv/syna`
 2. mount it back to `/var/lib/syna`
-3. start the same or newer compatible `syna-server` image
+3. run `syna-server doctor` while the serving process is stopped
+4. start the same or newer compatible `syna-server` image
 
 ## Upgrade Procedure
 
@@ -163,9 +164,9 @@ Restore procedure:
 2. build the new image from the updated repository checkout, or let Coolify
    rebuild from the updated repository
 3. stop the old container
-4. start the new container
-5. verify `/readyz`
-6. optionally run `syna-server doctor`
+4. run `syna-server doctor` and optional `syna-server gc` from the new image
+5. start the new container
+6. verify `/readyz`
 
 Rolling upgrade is not required in v1.
 
@@ -189,4 +190,14 @@ Recommended server hardening:
 - If disk fills up, uploads will fail first and then live sync will degrade.
 - If the reverse proxy does not support WebSockets, live sync will fall back to reconnect loops and appear broken.
 - If a root is removed, its encrypted server-side history is deleted only after retention and GC; backups taken before that point may still contain old encrypted bytes.
+- To irreversibly remove an entire workspace, stop the server and run
+  `syna-server purge-workspace <workspace-id>`. Obtain the ID from `syna status`.
+  The command immediately accepts the supplied ID and has no confirmation flag.
+  It removes workspace-scoped database state and exclusively owned object blobs;
+  logs, backups, infrastructure snapshots, and aggregate transfer counters must
+  be managed separately.
+- Clients that later discover a purged workspace stop syncing without deleting
+  local files or the recovery key. Run `syna connect --recreate <server-url>` on
+  one of those clients to explicitly create a fresh empty workspace with that
+  retained key.
 - If two Syna server containers point at the same mounted volume, behavior is undefined and unsupported.

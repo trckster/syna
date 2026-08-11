@@ -44,6 +44,38 @@ func TestJSONErrorFallsBackToHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestJSONErrorPreservesStatusAndCode(t *testing.T) {
+	client := &Client{
+		BaseURL: "https://example.test",
+		HTTPClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader(`{"code":"workspace_not_found","message":"workspace is gone"}`)),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		})},
+	}
+
+	err := client.doJSON(context.Background(), http.MethodGet, "/v1/bootstrap", nil, nil)
+	if !IsHTTPError(err, http.StatusNotFound, "workspace_not_found") {
+		t.Fatalf("error = %#v, expected typed workspace_not_found", err)
+	}
+	if err.Error() != "workspace is gone" {
+		t.Fatalf("error text = %q", err.Error())
+	}
+}
+
+func TestResponseErrorPreservesOperationForEmptyBody(t *testing.T) {
+	err := responseError("open websocket", &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader("")),
+	})
+	if err.Error() != "open websocket: http 401" {
+		t.Fatalf("error = %q", err.Error())
+	}
+}
+
 func TestDownloadObjectToRejectsOversizedBody(t *testing.T) {
 	body := []byte("abcdef")
 	client := &Client{

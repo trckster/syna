@@ -62,6 +62,21 @@ func TestCLIHelpDoesNotNeedDaemon(t *testing.T) {
 	}
 }
 
+func TestCLIRecreateRequiresServerURLWithoutStartingDaemon(t *testing.T) {
+	bin := buildSynaBinary(t)
+	home := shortTempDir(t, "recreate-usage")
+	stdout, stderr, err := runSyna(t, bin, home, "", "connect", "--recreate")
+	if err == nil {
+		t.Fatalf("expected usage error\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(stdout, "usage:") {
+		t.Fatalf("missing usage output:\n%s", stdout)
+	}
+	if _, err := os.Stat(clientPaths(home).SocketFile); !os.IsNotExist(err) {
+		t.Fatalf("malformed recreate should not start daemon, stat err=%v", err)
+	}
+}
+
 func TestCLIFreshConnectAutoStartsDaemonAndInitializesClient(t *testing.T) {
 	bin := buildSynaBinary(t)
 	server := newCLITestServer(t)

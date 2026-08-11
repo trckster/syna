@@ -77,19 +77,35 @@ func daemonCommand(paths commoncfg.ClientPaths, _ []string) error {
 }
 
 func connectCommand(paths commoncfg.ClientPaths, args []string) error {
-	if len(args) != 1 {
+	recreate := len(args) > 0 && args[0] == "--recreate"
+	if (recreate && len(args) != 2) || (!recreate && len(args) != 1) {
 		usage()
 		return exitCode(2)
+	}
+	serverURL := args[0]
+	if recreate {
+		serverURL = args[1]
 	}
 	socket, err := ensureSocket(paths)
 	if err != nil {
 		return err
 	}
-	req := daemon.ConnectRequest{ServerURL: args[0]}
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Recovery key (leave blank to create a new workspace): ")
-	line, _ := reader.ReadString('\n')
-	req.RecoveryKey = strings.TrimSpace(line)
+	req := daemon.ConnectRequest{ServerURL: serverURL, Recreate: recreate}
+	if recreate {
+		keyring, err := configstore.New(paths).LoadKeyring()
+		if err != nil {
+			return err
+		}
+		if keyring.WorkspaceKey == "" {
+			return errors.New("no retained recovery key is available")
+		}
+		req.RecoveryKey = keyring.WorkspaceKey
+	} else {
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print("Recovery key (leave blank to create a new workspace): ")
+		line, _ := reader.ReadString('\n')
+		req.RecoveryKey = strings.TrimSpace(line)
+	}
 	var resp daemon.ConnectResponse
 	if err := agentrpc.Call(socket, "connect", req, &resp); err != nil {
 		return err
@@ -244,6 +260,8 @@ func uninstallCommand(paths commoncfg.ClientPaths, args []string) error {
 func usage() {
 	fmt.Println(`usage:
   syna connect <server-url>  connect this device to a workspace
+  syna connect --recreate <server-url>
+                             recreate a purged workspace with its retained key
   syna disconnect            disconnect this device and leave local files untouched
   syna key show              print the stored workspace recovery key
   syna add <path>            add a file or directory under $HOME to sync

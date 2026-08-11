@@ -256,6 +256,10 @@ Use XDG paths:
 The local keyring's stored recovery key is also removed, so `syna key show`
 fails until the client connects to a workspace again.
 
+After the server reports that a configured workspace was purged, `server_url`
+and `workspace_id` are cleared from client state while the recovery key remains
+in the keyring for an explicit `syna connect --recreate` operation.
+
 ## Client SQLite Schema
 
 ### `workspace_state`

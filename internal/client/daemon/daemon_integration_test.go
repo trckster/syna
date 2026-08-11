@@ -18,6 +18,7 @@ import (
 
 	commoncfg "syna/internal/common/config"
 	"syna/internal/common/protocol"
+	"syna/internal/server/admin"
 	"syna/internal/server/api"
 	servercfg "syna/internal/server/config"
 	"syna/internal/server/db"
@@ -274,6 +275,87 @@ func TestIntegrationCreateFreshWorkspace(t *testing.T) {
 	}
 	if st.WorkspaceID != resp.WorkspaceID {
 		t.Fatalf("workspace ID mismatch: got %q want %q", st.WorkspaceID, resp.WorkspaceID)
+	}
+}
+
+func TestIntegrationPurgedWorkspaceStopsAndCanBeExplicitlyRecreated(t *testing.T) {
+	h := newRestartableHarness(t)
+	defer h.Close()
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	created, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	key := created.GeneratedRecoveryKey
+	workspaceID := created.WorkspaceID
+	if key == "" || workspaceID == "" {
+		t.Fatalf("missing created workspace credentials: %+v", created)
+	}
+
+	h.Stop()
+	if err := admin.PurgeWorkspace(h.serverDB, objectstore.New(h.dataDir), h.dataDir, workspaceID, io.Discard); err != nil {
+		t.Fatalf("PurgeWorkspace: %v", err)
+	}
+	h.Start(t)
+
+	reconnectCtx, stopReconnect := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.reconnectLoop(reconnectCtx)
+		close(done)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, statusErr := d.Status()
+		if statusErr != nil {
+			t.Fatalf("Status: %v", statusErr)
+		}
+		if status.Connection == protocol.ConnectionWorkspacePurged {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("client did not enter purged state: %+v", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stopReconnect()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect loop did not stop")
+	}
+	keyring, err := d.configs.LoadKeyring()
+	if err != nil {
+		t.Fatalf("LoadKeyring: %v", err)
+	}
+	if keyring.WorkspaceKey != key {
+		t.Fatalf("retained key = %q want %q", keyring.WorkspaceKey, key)
+	}
+
+	activeCtx, stopActive := context.WithCancel(context.Background())
+	defer stopActive()
+	d.runCtx = activeCtx
+	recreated, err := d.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: key,
+		Recreate:    true,
+	})
+	if err != nil {
+		t.Fatalf("recreate Connect: %v", err)
+	}
+	if recreated.WorkspaceID != workspaceID || recreated.GeneratedRecoveryKey != "" {
+		t.Fatalf("unexpected recreate response: %+v", recreated)
+	}
+	if seq, err := h.serverDB.CurrentSeq(workspaceID); err != nil || seq != 0 {
+		t.Fatalf("recreated workspace seq = %d err=%v", seq, err)
+	}
+	d.mu.Lock()
+	reconnectStarted := d.reconnectCancel != nil
+	d.mu.Unlock()
+	if !reconnectStarted {
+		t.Fatal("explicit recreation did not start a replacement reconnect loop")
 	}
 }
 
