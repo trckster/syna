@@ -1,9 +1,16 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"syna/internal/common/protocol"
+)
 
 func (a *API) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, protocol.HealthResponse{
+		OK:           true,
+		Capabilities: []string{protocol.CapabilityRootIncarnationBinding},
+	})
 }
 
 func (a *API) handleReadyz(w http.ResponseWriter, r *http.Request) {

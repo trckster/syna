@@ -433,6 +433,9 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 	if d.conn == nil || d.keys == nil || d.cfg.WorkspaceID == "" {
 		return errors.New("not connected")
 	}
+	if err := d.requireRootIncarnationBinding(ctx); err != nil {
+		return err
+	}
 	roots, err := d.stateDB.ListRoots()
 	if err != nil {
 		return err
@@ -656,6 +659,17 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		DoneEntries:  totals.TotalEntries,
 		TotalEntries: totals.TotalEntries,
 	})
+	return nil
+}
+
+func (d *Daemon) requireRootIncarnationBinding(ctx context.Context) error {
+	supported, err := d.conn.SupportsCapability(ctx, protocol.CapabilityRootIncarnationBinding)
+	if err != nil {
+		return fmt.Errorf("check server sync capabilities: %w", err)
+	}
+	if !supported {
+		return errors.New("server upgrade required: initial root sync needs root-incarnation binding support")
+	}
 	return nil
 }
 
@@ -1854,7 +1868,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		if root.Kind == protocol.RootKindDir && rootPathMissing(root.TargetAbsPath) {
-			return d.handleDeletedRoot(ctx, *root, queueRetryable)
+			return d.handleDeletedRoot(ctx, *root, queueRetryable, expectedRootSeq)
 		}
 		scan = &scanner.Result{RootKind: root.Kind}
 	}
@@ -2083,11 +2097,11 @@ func (d *Daemon) recordScanWarnings(root state.Root, warnings []string) error {
 	return nil
 }
 
-func (d *Daemon) handleDeletedRoot(ctx context.Context, root state.Root, queueRetryable bool) error {
+func (d *Daemon) handleDeletedRoot(ctx context.Context, root state.Root, queueRetryable bool, expectedRootSeq int64) error {
 	if root.State != protocol.RootStateActive {
 		return nil
 	}
-	if _, err := d.submitEvent(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
+	if _, err := d.submitEventForIncarnation(ctx, root.RootID, "", "", protocol.EventRootRemove, nil, expectedRootSeq, protocol.RootRemovePayload{RootID: root.RootID}, nil); err != nil {
 		if isBenignRootRemoveError(err) {
 			return d.markRootRemoved(root)
 		}
@@ -2419,6 +2433,9 @@ func (d *Daemon) recoverPendingInitialRoot(ctx context.Context, op state.Pending
 	if !matched {
 		d.markStagedRoot(op.RootID)
 		return true, nil
+	}
+	if err := d.requireRootIncarnationBinding(ctx); err != nil {
+		return false, err
 	}
 	if err := d.reconcileInitialRoot(ctx, op.RootID, remoteSeq); err != nil {
 		return false, err

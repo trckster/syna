@@ -437,6 +437,15 @@ func TestSubmitEventRejectsPreviousRootIncarnation(t *testing.T) {
 	if mismatch.CurrentSeq != newRoot.AcceptedSeq {
 		t.Fatalf("current incarnation = %d want %d", mismatch.CurrentSeq, newRoot.AcceptedSeq)
 	}
+	_, err = database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:         "root-1",
+		EventType:      protocol.EventRootRemove,
+		RootCreatedSeq: &oldRoot.AcceptedSeq,
+		PayloadBlob:    "remove-new-with-old-incarnation",
+	})
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("SubmitEvent(root_remove) error = %v, want RootIncarnationMismatchError", err)
+	}
 	after, err := database.CurrentSeq(sess.WorkspaceID)
 	if err != nil {
 		t.Fatalf("CurrentSeq(after): %v", err)

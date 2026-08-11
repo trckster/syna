@@ -54,13 +54,17 @@ func (db *DB) SubmitEvent(sess *Session, req protocol.EventSubmitRequest) (*Subm
 			return nil, fmt.Errorf("root already active")
 		}
 	case protocol.EventRootRemove:
+		var createdSeq int64
 		var removedSeq sql.NullInt64
 		err := tx.QueryRow(`
-			SELECT removed_seq FROM roots
+			SELECT created_seq, removed_seq FROM roots
 			WHERE workspace_id = ? AND root_id = ?
-		`, sess.WorkspaceID, req.RootID).Scan(&removedSeq)
+		`, sess.WorkspaceID, req.RootID).Scan(&createdSeq, &removedSeq)
 		if err != nil {
 			return nil, fmt.Errorf("unknown root")
+		}
+		if req.RootCreatedSeq != nil && *req.RootCreatedSeq != createdSeq {
+			return nil, &RootIncarnationMismatchError{CurrentSeq: createdSeq}
 		}
 		if removedSeq.Valid {
 			return nil, fmt.Errorf("root already removed")

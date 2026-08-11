@@ -4,6 +4,13 @@ import "time"
 
 const VersionHeader = "X-Syna-Protocol"
 
+const CapabilityRootIncarnationBinding = "root_incarnation_binding"
+
+type HealthResponse struct {
+	OK           bool     `json:"ok"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
 const (
 	MaxFileChunkPlainSize = 4 << 20
 	MaxSnapshotPlainSize  = 16 << 20

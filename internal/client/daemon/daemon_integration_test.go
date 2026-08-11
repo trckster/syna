@@ -1039,6 +1039,53 @@ func TestIntegrationAddRootQueuesRecoveryAfterLostRootAddResponse(t *testing.T) 
 	}
 }
 
+func TestIntegrationAddRootRejectsServerWithoutIncarnationCapabilityBeforeMutation(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/healthz" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Request:    req,
+			}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	err := d.AddRoot(context.Background(), rootDir)
+	if err == nil || !strings.Contains(err.Error(), "server upgrade required") {
+		t.Fatalf("AddRoot error = %v, want preflight upgrade error", err)
+	}
+	current, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq: %v", err)
+	}
+	if current != 0 {
+		t.Fatalf("server sequence = %d want 0 after capability rejection", current)
+	}
+	roots, err := d.stateDB.ListRoots()
+	if err != nil {
+		t.Fatalf("ListRoots: %v", err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("local roots = %+v, want none after capability rejection", roots)
+	}
+}
+
 func TestIntegrationAddRootReportsPostConflictReconcileFailure(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()
@@ -1216,6 +1263,21 @@ func TestIntegrationInitialUploadDoesNotCrossReplacementIncarnation(t *testing.T
 	}
 	if beforeFlush != replacementHead {
 		t.Fatalf("replacement head advanced from %d to %d after rejected initial event", replacementHead, beforeFlush)
+	}
+	if err := os.RemoveAll(rootDir1); err != nil {
+		t.Fatalf("RemoveAll(first missing root): %v", err)
+	}
+	err = first.rescanRootHintWithRetry(context.Background(), root.RootID, "", true, false, true, ops[0].BaseSeq)
+	var incarnationConflict *RootIncarnationConflictError
+	if !errors.As(err, &incarnationConflict) {
+		t.Fatalf("forced missing-root rescan error = %v, want incarnation conflict", err)
+	}
+	afterRejectedRemove, err := h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(after rejected remove): %v", err)
+	}
+	if afterRejectedRemove != beforeFlush {
+		t.Fatalf("replacement head advanced from %d to %d after rejected old root_remove", beforeFlush, afterRejectedRemove)
 	}
 	if err := first.flushPendingOps(context.Background()); err != nil {
 		t.Fatalf("flushPendingOps: %v", err)

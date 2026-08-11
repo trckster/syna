@@ -83,6 +83,19 @@ func (c *Client) Bootstrap(ctx context.Context) (*protocol.BootstrapResponse, er
 	return &resp, nil
 }
 
+func (c *Client) SupportsCapability(ctx context.Context, capability string) (bool, error) {
+	var resp protocol.HealthResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/healthz", nil, &resp); err != nil {
+		return false, err
+	}
+	for _, current := range resp.Capabilities {
+		if current == capability {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (c *Client) FetchEvents(ctx context.Context, afterSeq int64, limit int) (*protocol.EventFetchResponse, *protocol.ErrorResponse, error) {
 	var resp protocol.EventFetchResponse
 	var apiErr protocol.ErrorResponse
