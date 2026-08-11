@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 
 	"syna/internal/client/scanner"
 	"syna/internal/client/snapshotter"
@@ -142,23 +143,26 @@ func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, r
 	return nil
 }
 
-func (d *Daemon) publishInitialSnapshot(ctx context.Context, rootID string, sync *initialRootSync) {
+func (d *Daemon) publishInitialSnapshot(ctx context.Context, rootID string, sync *initialRootSync) error {
 	if len(sync.Entries) == 0 {
-		return
+		return nil
 	}
 	lastSeq := sync.Entries[len(sync.Entries)-1].CurrentSeq
 	sync.Snapshot.BaseSeq = lastSeq
 	blob, objectID, err := snapshotter.BuildSnapshotBlob(d.keys, d.cfg.WorkspaceID, rootID, lastSeq, sync.Snapshot)
 	if err != nil {
-		return
+		return fmt.Errorf("build snapshot: %w", err)
 	}
 	if err := d.conn.UploadObject(ctx, objectID, "snapshot", int64(len(blob)), blob); err != nil {
-		return
+		return fmt.Errorf("upload snapshot: %w", err)
 	}
-	_, _ = d.conn.SubmitSnapshot(ctx, protocol.SnapshotSubmitRequest{
+	if _, err := d.conn.SubmitSnapshot(ctx, protocol.SnapshotSubmitRequest{
 		RootID:     rootID,
 		BaseSeq:    lastSeq,
 		ObjectID:   objectID,
 		ObjectRefs: dedupe(sync.ObjectRefs),
-	})
+	}); err != nil {
+		return fmt.Errorf("submit snapshot: %w", err)
+	}
+	return nil
 }

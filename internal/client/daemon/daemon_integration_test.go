@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -435,6 +436,463 @@ func TestIntegrationReplayOwnRootAddKeepsRootActive(t *testing.T) {
 	if root.State != protocol.RootStateActive {
 		t.Fatalf("own root_add replay changed root state to %q", root.State)
 	}
+}
+
+func TestIntegrationAddRootStopsFinalizingAfterConcurrentRemove(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	removed := false
+	err = first.AddRootWithProgress(context.Background(), rootDir, func(progress AddProgress) {
+		if removed || progress.Stage != "syncing" || progress.DoneEntries != progress.TotalEntries {
+			return
+		}
+		removed = true
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp: %v", err)
+		}
+		if err := second.RemoveRoot(context.Background(), rootDir); err != nil {
+			t.Fatalf("second RemoveRoot: %v", err)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "no longer active after initial sync") {
+		t.Fatalf("AddRootWithProgress error = %v, want concurrent removal error", err)
+	}
+	if !removed {
+		t.Fatal("test did not submit the concurrent root removal")
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	if root.State != protocol.RootStateRemoved {
+		t.Fatalf("root state = %s want %s", root.State, protocol.RootStateRemoved)
+	}
+
+	if err := os.WriteFile(filepath.Join(rootDir, "after-remove.txt"), []byte("ignored\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after remove): %v", err)
+	}
+	select {
+	case change := <-first.changeCh:
+		t.Fatalf("removed root retained watcher and emitted change: %+v", change)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func TestIntegrationAddRootReconcilesRemoveDuringSnapshotPublication(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	removed := false
+	err = first.AddRootWithProgress(context.Background(), rootDir, func(progress AddProgress) {
+		if removed || progress.Stage != "finalizing" {
+			return
+		}
+		removed = true
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp: %v", err)
+		}
+		if err := second.RemoveRoot(context.Background(), rootDir); err != nil {
+			t.Fatalf("second RemoveRoot: %v", err)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "no longer active after initial sync") {
+		t.Fatalf("AddRootWithProgress error = %v, want concurrent removal error", err)
+	}
+	if !removed {
+		t.Fatal("test did not submit the concurrent root removal")
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	if root.State != protocol.RootStateRemoved {
+		t.Fatalf("root state = %s want %s", root.State, protocol.RootStateRemoved)
+	}
+
+	if err := os.WriteFile(filepath.Join(rootDir, "after-remove.txt"), []byte("ignored\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after remove): %v", err)
+	}
+	select {
+	case change := <-first.changeCh:
+		t.Fatalf("removed root retained watcher and emitted change: %+v", change)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func TestIntegrationAddRootStagesConcurrentReplacement(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	replaced := false
+	err = first.AddRootWithProgress(context.Background(), rootDir, func(progress AddProgress) {
+		if replaced || progress.Stage != "finalizing" {
+			return
+		}
+		replaced = true
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp: %v", err)
+		}
+		if err := second.RemoveRoot(context.Background(), rootDir); err != nil {
+			t.Fatalf("second RemoveRoot: %v", err)
+		}
+		if err := second.AddRoot(context.Background(), rootDir); err != nil {
+			t.Fatalf("second AddRoot replacement: %v", err)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "replaced during initial sync") {
+		t.Fatalf("first AddRootWithProgress error = %v, want replacement error", err)
+	}
+	if !replaced {
+		t.Fatal("test did not replace the root")
+	}
+	root, rootErr := first.stateDB.RootByHomeRel("notes")
+	if rootErr != nil {
+		t.Fatalf("RootByHomeRel: %v", rootErr)
+	}
+	if !first.isRootStaged(root.RootID) {
+		t.Fatal("replacement root was not staged before reconciliation")
+	}
+}
+
+func TestIntegrationAddRootReconcilesRemoveAfterSnapshotPublication(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	removed := false
+	first.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil || removed || req.Method != http.MethodPost || req.URL.Path != "/v1/snapshots" || resp.StatusCode != http.StatusOK {
+			return resp, err
+		}
+		removed = true
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp: %v", err)
+		}
+		if err := second.RemoveRoot(context.Background(), rootDir); err != nil {
+			t.Fatalf("second RemoveRoot: %v", err)
+		}
+		return resp, nil
+	})
+
+	err = first.AddRoot(context.Background(), rootDir)
+	if err == nil || !strings.Contains(err.Error(), "no longer active after initial sync") {
+		t.Fatalf("AddRoot error = %v, want concurrent removal error", err)
+	}
+	if !removed {
+		t.Fatal("test did not submit the post-publication root removal")
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	if root.State != protocol.RootStateRemoved {
+		t.Fatalf("root state = %s want %s", root.State, protocol.RootStateRemoved)
+	}
+}
+
+func TestIntegrationAddRootKeepsWatcherWhenSnapshotPublicationFails(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/snapshots" {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Status:     "503 Service Unavailable",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"code":"temporarily_unavailable","message":"snapshot unavailable"}`)),
+				Request:    req,
+			}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+
+	changedPath := filepath.Join(rootDir, "after-add.txt")
+	if err := os.WriteFile(changedPath, []byte("watched\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after add): %v", err)
+	}
+	select {
+	case change := <-d.changeCh:
+		if change.RootID == "" {
+			t.Fatalf("watcher emitted change without root: %+v", change)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active root was not watched after snapshot publication failure")
+	}
+}
+
+func TestIntegrationAddRootKeepsWatcherWhenVerificationFails(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	failed := false
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if !failed && req.Method == http.MethodGet && req.URL.Path == "/v1/bootstrap" {
+			failed = true
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Status:     "503 Service Unavailable",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"code":"temporarily_unavailable","message":"bootstrap unavailable"}`)),
+				Request:    req,
+			}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	if !failed {
+		t.Fatal("test did not fail root incarnation verification")
+	}
+
+	if err := os.WriteFile(filepath.Join(rootDir, "after-add.txt"), []byte("watched\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after add): %v", err)
+	}
+	select {
+	case <-d.changeCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active root was not watched after transient verification failure")
+	}
+}
+
+func TestIntegrationAddRootKeepsWatcherWhenFinalCatchUpFails(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	eventFetches := 0
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/v1/events" {
+			eventFetches++
+			if eventFetches == 2 {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Status:     "503 Service Unavailable",
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"code":"temporarily_unavailable","message":"events unavailable"}`)),
+					Request:    req,
+				}, nil
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	if eventFetches < 2 {
+		t.Fatalf("event fetch count = %d want at least 2", eventFetches)
+	}
+
+	if err := os.WriteFile(filepath.Join(rootDir, "after-add.txt"), []byte("watched\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after add): %v", err)
+	}
+	select {
+	case <-d.changeCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active root was not watched after transient final catch-up failure")
+	}
+}
+
+func TestIntegrationAddRootRetriesPersistentFinalizationFailure(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	retryCtx, retryCancel := context.WithCancel(context.Background())
+	defer retryCancel()
+	d.runCtx = retryCtx
+	eventFetches := 0
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/v1/events" {
+			eventFetches++
+			if eventFetches == 2 || eventFetches == 3 {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Status:     "503 Service Unavailable",
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"code":"temporarily_unavailable","message":"events unavailable"}`)),
+					Request:    req,
+				}, nil
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err == nil || !strings.Contains(err.Error(), "catch up after initial sync") {
+		t.Fatalf("AddRoot error = %v, want finalization catch-up error", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		changedPath := filepath.Join(rootDir, fmt.Sprintf("after-add-%d.txt", attempt))
+		if err := os.WriteFile(changedPath, []byte("watched\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(after add): %v", err)
+		}
+		select {
+		case <-d.changeCh:
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatal("background finalization did not install the watcher")
 }
 
 func TestIntegrationCatchUpPaginatesThroughServerLimit(t *testing.T) {

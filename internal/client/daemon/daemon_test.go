@@ -159,6 +159,85 @@ func TestConsumeOwnRootRemoveAppliesWhenRootStillActive(t *testing.T) {
 	}
 }
 
+func TestConsumeOwnRootAddReactivatesRemovedRoot(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	keys, err := commoncrypto.Derive(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Derive: %v", err)
+	}
+	d.keys = keys
+	d.cfg.WorkspaceID = "workspace-test"
+	d.cfg.DeviceID = "device-test"
+	homeRelPath := "notes"
+	rootID := commoncrypto.RootID(keys, homeRelPath)
+	target := filepath.Join(home, homeRelPath)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := d.stateDB.UpsertRoot(state.Root{
+		RootID:        rootID,
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   homeRelPath,
+		TargetAbsPath: target,
+		State:         protocol.RootStateRemoved,
+	}); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+
+	event := mustDaemonEvent(t, keys, d.cfg.WorkspaceID, rootID, "", protocol.EventRootAdd, protocol.RootAddPayload{
+		RootID:      rootID,
+		Kind:        protocol.RootKindDir,
+		HomeRelPath: homeRelPath,
+	})
+	event.AuthorDeviceID = d.cfg.DeviceID
+	if err := d.consumeRemoteEvent(context.Background(), event); err != nil {
+		t.Fatalf("consumeRemoteEvent own root_add: %v", err)
+	}
+
+	root, err := d.stateDB.RootByID(rootID)
+	if err != nil {
+		t.Fatalf("RootByID: %v", err)
+	}
+	if root.State != protocol.RootStateActive {
+		t.Fatalf("root state = %s want %s", root.State, protocol.RootStateActive)
+	}
+	st, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq != event.Seq {
+		t.Fatalf("last server seq = %d want %d", st.LastServerSeq, event.Seq)
+	}
+}
+
+func TestActiveRootAfterInitialSyncRejectsReplacement(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if err := d.stateDB.UpsertRoot(state.Root{
+		RootID:      "root-test",
+		Kind:        protocol.RootKindDir,
+		State:       protocol.RootStateActive,
+		HomeRelPath: "notes",
+	}); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+	d.conn = newBootstrapObjectClient(t, protocol.BootstrapResponse{
+		Roots: []protocol.BootstrapRoot{{RootID: "root-test", CreatedSeq: 17}},
+	}, protocol.EventFetchResponse{})
+
+	matched, active, err := d.verifyRootIncarnation(context.Background(), "root-test", 11)
+	if err != nil {
+		t.Fatalf("verifyRootIncarnation: %v", err)
+	}
+	if matched || !active {
+		t.Fatalf("verifyRootIncarnation = matched %t active %t, want false true", matched, active)
+	}
+}
+
 func TestConsumeOwnPostSnapshotEventReplaysWhenMissingLocally(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "home")
 	setHome(t, home)

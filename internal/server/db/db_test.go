@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,6 +331,58 @@ func TestSaveSnapshotAcceptsEqualLatestSnapshotSeq(t *testing.T) {
 		ObjectID: "snapshot-2",
 	}); err != nil {
 		t.Fatalf("SaveSnapshot(equal latest seq): %v", err)
+	}
+}
+
+func TestSaveSnapshotRejectsPreviousRootIncarnation(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	insertObject(t, database, "snapshot-old")
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-old",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add old): %v", err)
+	}
+	oldContent, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		PathID:      "path-1",
+		EventType:   protocol.EventFilePut,
+		BaseSeq:     ptrInt64(0),
+		PayloadBlob: "file-put-old",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(file_put old): %v", err)
+	}
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		EventType:   protocol.EventRootRemove,
+		PayloadBlob: "remove",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_remove): %v", err)
+	}
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-new",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_add new): %v", err)
+	}
+
+	err = database.SaveSnapshot(sess, protocol.SnapshotSubmitRequest{
+		RootID:   "root-1",
+		BaseSeq:  oldContent.AcceptedSeq,
+		ObjectID: "snapshot-old",
+	})
+	if err == nil || !strings.Contains(err.Error(), "predates current root incarnation") {
+		t.Fatalf("SaveSnapshot error = %v, want root incarnation rejection", err)
 	}
 }
 

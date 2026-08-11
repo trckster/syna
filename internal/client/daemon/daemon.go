@@ -459,9 +459,11 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		Kind:        scan.RootKind,
 		HomeRelPath: homeRelPath,
 	}
-	if _, err := d.submitEvent(ctx, rootID, "", scan.RootKind, protocol.EventRootAdd, nil, rootAddPayload, nil); err != nil {
+	rootAddResp, err := d.submitEvent(ctx, rootID, "", scan.RootKind, protocol.EventRootAdd, nil, rootAddPayload, nil)
+	if err != nil {
 		return err
 	}
+	rootCreatedSeq := rootAddResp.AcceptedSeq
 
 	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan, progress, totals)
 	if err != nil {
@@ -472,6 +474,22 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 	}
 	if err := d.bootstrapOrCatchUp(ctx); err != nil {
 		return err
+	}
+	currentRoot, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
+	if err != nil {
+		return err
+	}
+	matched, remoteActive, verifyErr := d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+	if verifyErr != nil {
+		d.logger.Printf("could not verify root %s before snapshot publication: %v", rootID, verifyErr)
+	} else if !remoteActive {
+		return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	} else if !matched {
+		done, replaceErr := d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+		if !done {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+		}
+		return replaceErr
 	}
 	reportAddProgress(progress, AddProgress{
 		Stage:        "finalizing",
@@ -484,8 +502,45 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		DoneEntries:  totals.DoneEntries,
 		TotalEntries: totals.TotalEntries,
 	})
-	d.publishInitialSnapshot(ctx, rootID, initialSync)
-	d.addWatcherRoot(rootID, absPath)
+	publishErr := d.publishInitialSnapshot(ctx, rootID, initialSync)
+	if catchUpErr := d.bootstrapOrCatchUp(ctx); catchUpErr != nil {
+		d.logger.Printf("could not catch up root %s after snapshot publication: %v", rootID, catchUpErr)
+		if retryErr := d.bootstrapOrCatchUp(ctx); retryErr != nil {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+			return fmt.Errorf("catch up after initial sync: %v; retry: %w", catchUpErr, retryErr)
+		}
+	}
+	currentRoot, err = d.activeRootAfterInitialSync(rootID, homeRelPath)
+	if err != nil {
+		return err
+	}
+	matched, remoteActive, verifyErr = d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+	if verifyErr != nil {
+		d.logger.Printf("could not verify root %s after snapshot publication: %v", rootID, verifyErr)
+		matched, remoteActive, verifyErr = d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+		if verifyErr != nil {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+			return fmt.Errorf("verify root after initial sync: %w", verifyErr)
+		}
+	}
+	if !remoteActive {
+		return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	if !matched {
+		done, replaceErr := d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+		if !done {
+			d.scheduleInitialRootFinalization(rootID, homeRelPath, rootCreatedSeq)
+		}
+		return replaceErr
+	}
+	if publishErr != nil {
+		d.logger.Printf("initial snapshot for root %s was not published: %v", rootID, publishErr)
+	}
+	if d.isRootStaged(rootID) {
+		d.enqueueRootRescan(rootID)
+		return fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	d.addWatcherRoot(rootID, currentRoot.TargetAbsPath)
 	reportAddProgress(progress, AddProgress{
 		Stage:        "done",
 		Message:      "sync complete",
@@ -498,6 +553,142 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		TotalEntries: totals.TotalEntries,
 	})
 	return nil
+}
+
+func (d *Daemon) activeRootAfterInitialSync(rootID, homeRelPath string) (*state.Root, error) {
+	root, err := d.stateDB.RootByID(rootID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		return nil, err
+	}
+	if root.State != protocol.RootStateActive {
+		return nil, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	return root, nil
+}
+
+func (d *Daemon) verifyRootIncarnation(ctx context.Context, rootID string, createdSeq int64) (matched, active bool, err error) {
+	remoteCreatedSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+	if err != nil || !active {
+		return false, active, err
+	}
+	return remoteCreatedSeq == createdSeq, true, nil
+}
+
+func (d *Daemon) remoteRootIncarnation(ctx context.Context, rootID string) (createdSeq int64, active bool, err error) {
+	bootstrap, err := d.conn.Bootstrap(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, remoteRoot := range bootstrap.Roots {
+		if remoteRoot.RootID != rootID {
+			continue
+		}
+		return remoteRoot.CreatedSeq, true, nil
+	}
+	return 0, false, nil
+}
+
+func (d *Daemon) stageReplacedRootAfterInitialSync(ctx context.Context, rootID, homeRelPath string) (bool, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		beforeSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			return true, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		// Stage before consuming the replacement lifecycle so a resync-required
+		// bootstrap cannot apply the new incarnation over the old local tree.
+		d.markStagedRoot(rootID)
+		if err := d.bootstrapOrCatchUp(ctx); err != nil {
+			return false, err
+		}
+		afterSeq, active, err := d.remoteRootIncarnation(ctx, rootID)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			continue
+		}
+		if beforeSeq != afterSeq {
+			continue
+		}
+		if _, err := d.activeRootAfterInitialSync(rootID, homeRelPath); err != nil {
+			return true, err
+		}
+		d.enqueueRootRescan(rootID)
+		return true, fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	return false, fmt.Errorf("root %q kept changing during initial sync", homeRelPath)
+}
+
+func (d *Daemon) scheduleInitialRootFinalization(rootID, homeRelPath string, createdSeq int64) {
+	ctx := d.runCtx
+	if ctx == nil {
+		return
+	}
+	go func() {
+		delay := time.Second
+		for {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			d.syncMu.Lock()
+			done, err := d.retryInitialRootFinalization(ctx, rootID, homeRelPath, createdSeq)
+			d.syncMu.Unlock()
+			if done {
+				if err != nil && !errors.Is(err, context.Canceled) {
+					d.logger.Printf("stopped finalizing root %s: %v", rootID, err)
+				}
+				return
+			}
+			if err != nil && !errors.Is(err, context.Canceled) {
+				d.logger.Printf("retry finalizing root %s: %v", rootID, err)
+			}
+			if delay < 30*time.Second {
+				delay *= 2
+			}
+		}
+	}()
+}
+
+func (d *Daemon) retryInitialRootFinalization(ctx context.Context, rootID, homeRelPath string, createdSeq int64) (bool, error) {
+	d.mu.Lock()
+	connected := d.conn != nil && d.keys != nil && d.cfg.WorkspaceID != ""
+	d.mu.Unlock()
+	if !connected {
+		return false, errors.New("not connected")
+	}
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return false, err
+	}
+	root, err := d.activeRootAfterInitialSync(rootID, homeRelPath)
+	if err != nil {
+		return true, err
+	}
+	matched, active, err := d.verifyRootIncarnation(ctx, rootID, createdSeq)
+	if err != nil {
+		return false, err
+	}
+	if !active {
+		return true, fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+	}
+	if !matched {
+		return d.stageReplacedRootAfterInitialSync(ctx, rootID, homeRelPath)
+	}
+	if d.isRootStaged(rootID) {
+		d.enqueueRootRescan(rootID)
+		return true, fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+	}
+	d.addWatcherRoot(rootID, root.TargetAbsPath)
+	return true, nil
 }
 
 func (d *Daemon) RemoveRoot(ctx context.Context, input string) error {
@@ -1208,8 +1399,9 @@ func (d *Daemon) eventMaterializedLocally(event protocol.EventRecord) (bool, err
 	switch event.EventType {
 	case protocol.EventRootAdd:
 		// An active root is created locally before root_add is submitted. A
-		// removed root has already progressed beyond this lifecycle event.
-		return root != nil, nil
+		// removed row may instead be the result of replaying an earlier
+		// remove/add lifecycle, so it must be reactivated by this event.
+		return root != nil && root.State == protocol.RootStateActive, nil
 	case protocol.EventRootRemove:
 		return root == nil || root.State == protocol.RootStateRemoved, nil
 	}
