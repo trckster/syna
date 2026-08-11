@@ -84,6 +84,14 @@ func (a *API) handleEventSubmit(w http.ResponseWriter, r *http.Request, sess *db
 	defer a.eventMu.Unlock()
 	result, err := a.db.SubmitEvent(sess, req)
 	if err != nil {
+		var incarnationMismatch *db.RootIncarnationMismatchError
+		if errors.As(err, &incarnationMismatch) {
+			writeJSON(w, http.StatusConflict, protocol.ErrorResponse{
+				Code:       "root_incarnation_mismatch",
+				CurrentSeq: incarnationMismatch.CurrentSeq,
+			})
+			return
+		}
 		var mismatch *db.PathHeadMismatchError
 		if errors.As(err, &mismatch) {
 			writeJSON(w, http.StatusConflict, protocol.ErrorResponse{

@@ -19,18 +19,28 @@ import (
 	"syna/internal/common/protocol"
 )
 
-func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item scanner.Entry, conflict *PathConflictError) (returnErr error) {
+func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item scanner.Entry, conflict *PathConflictError) error {
+	return d.resolveFileConflictForIncarnation(ctx, root, item, conflict, 0)
+}
+
+func (d *Daemon) resolveFileConflictForIncarnation(ctx context.Context, root state.Root, item scanner.Entry, conflict *PathConflictError, rootCreatedSeq int64) (returnErr error) {
 	stagedPath, cleanup, err := d.stageLocalFileCopy(item.AbsPath)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	retainStaged := false
+	defer func() {
+		if !retainStaged {
+			cleanup()
+		}
+	}()
 	localPreserved := false
 	defer func() {
 		if returnErr == nil || localPreserved {
 			return
 		}
 		if restoreErr := d.restoreStagedFileReplacingTarget(root, item, stagedPath); restoreErr != nil {
+			retainStaged = true
 			returnErr = fmt.Errorf("%v; restore staged local file: %w", returnErr, restoreErr)
 		}
 	}()
@@ -74,7 +84,7 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		localPreserved = true
 		return nil
 	}
-	if done, err := d.restoreNewerLocalEdit(ctx, root, item, stagedPath, baselineHash); err != nil {
+	if done, err := d.restoreNewerLocalEdit(ctx, root, item, stagedPath, baselineHash, rootCreatedSeq); err != nil {
 		return err
 	} else if done {
 		localPreserved = true
@@ -103,7 +113,7 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		if err != nil {
 			return err
 		}
-		resp, err := d.submitEvent(ctx, root.RootID, conflictPathID, "", protocol.EventFilePut, &baseSeq, up.Payload, up.Refs)
+		resp, err := d.submitEventForIncarnation(ctx, root.RootID, conflictPathID, "", protocol.EventFilePut, &baseSeq, rootCreatedSeq, up.Payload, up.Refs)
 		if err == nil {
 			localPreserved = true
 			return d.stateDB.UpsertEntry(state.Entry{
@@ -154,7 +164,7 @@ func (d *Daemon) restoreStagedFileReplacingTarget(root state.Root, item scanner.
 // entries rebuilt from a snapshot). Instead of demoting the local edit to a
 // conflict copy, restore it over the just-applied remote content and upload it
 // with the corrected head seq.
-func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, item scanner.Entry, stagedPath, baselineHash string) (bool, error) {
+func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, item scanner.Entry, stagedPath, baselineHash string, rootCreatedSeq int64) (bool, error) {
 	if baselineHash == "" || baselineHash == item.ContentSHA256 {
 		return false, nil
 	}
@@ -174,7 +184,7 @@ func (d *Daemon) restoreNewerLocalEdit(ctx context.Context, root state.Root, ite
 	if err != nil {
 		return false, err
 	}
-	resp, err := d.submitEvent(ctx, root.RootID, pathID, "", protocol.EventFilePut, &current.CurrentSeq, up.Payload, up.Refs)
+	resp, err := d.submitEventForIncarnation(ctx, root.RootID, pathID, "", protocol.EventFilePut, &current.CurrentSeq, rootCreatedSeq, up.Payload, up.Refs)
 	if err != nil {
 		var conflict *PathConflictError
 		if errors.As(err, &conflict) {

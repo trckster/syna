@@ -69,16 +69,20 @@ func (db *DB) SubmitEvent(sess *Session, req protocol.EventSubmitRequest) (*Subm
 		if req.PathID == "" || req.BaseSeq == nil {
 			return nil, fmt.Errorf("content events require path_id and base_seq")
 		}
+		var createdSeq int64
 		var removedSeq sql.NullInt64
 		err := tx.QueryRow(`
-			SELECT removed_seq FROM roots
+			SELECT created_seq, removed_seq FROM roots
 			WHERE workspace_id = ? AND root_id = ?
-		`, sess.WorkspaceID, req.RootID).Scan(&removedSeq)
+		`, sess.WorkspaceID, req.RootID).Scan(&createdSeq, &removedSeq)
 		if err != nil {
 			return nil, fmt.Errorf("unknown root")
 		}
 		if removedSeq.Valid {
 			return nil, fmt.Errorf("root removed")
+		}
+		if req.RootCreatedSeq != nil && *req.RootCreatedSeq != createdSeq {
+			return nil, &RootIncarnationMismatchError{CurrentSeq: createdSeq}
 		}
 
 		var headSeq int64
@@ -214,6 +218,14 @@ func (db *DB) SubmitEvent(sess *Session, req protocol.EventSubmitRequest) (*Subm
 
 type PathHeadMismatchError struct {
 	CurrentSeq int64
+}
+
+type RootIncarnationMismatchError struct {
+	CurrentSeq int64
+}
+
+func (e *RootIncarnationMismatchError) Error() string {
+	return "root incarnation mismatch"
 }
 
 func (e *PathHeadMismatchError) Error() string {

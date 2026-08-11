@@ -112,13 +112,14 @@ type BootstrapResponse struct {
 }
 
 type EventSubmitRequest struct {
-	RootID      string    `json:"root_id"`
-	PathID      string    `json:"path_id,omitempty"`
-	RootKind    RootKind  `json:"root_kind,omitempty"`
-	EventType   EventType `json:"event_type"`
-	BaseSeq     *int64    `json:"base_seq,omitempty"`
-	PayloadBlob string    `json:"payload_blob"`
-	ObjectRefs  []string  `json:"object_refs"`
+	RootID         string    `json:"root_id"`
+	PathID         string    `json:"path_id,omitempty"`
+	RootKind       RootKind  `json:"root_kind,omitempty"`
+	EventType      EventType `json:"event_type"`
+	BaseSeq        *int64    `json:"base_seq,omitempty"`
+	RootCreatedSeq *int64    `json:"root_created_seq,omitempty"`
+	PayloadBlob    string    `json:"payload_blob"`
+	ObjectRefs     []string  `json:"object_refs"`
 }
 
 type EventSubmitResponse struct {

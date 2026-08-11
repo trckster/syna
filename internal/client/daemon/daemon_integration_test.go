@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"syna/internal/client/scanner"
+	"syna/internal/client/state"
 	commoncfg "syna/internal/common/config"
 	"syna/internal/common/protocol"
 	"syna/internal/server/admin"
@@ -1122,7 +1124,7 @@ func TestIntegrationAddRootReportsPostConflictReconcileFailure(t *testing.T) {
 	}
 }
 
-func TestIntegrationInitialRecoveryDoesNotRescanReplacementIncarnation(t *testing.T) {
+func TestIntegrationInitialUploadDoesNotCrossReplacementIncarnation(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()
 
@@ -1155,6 +1157,7 @@ func TestIntegrationInitialRecoveryDoesNotRescanReplacementIncarnation(t *testin
 	setHome(t, home1)
 	eventSubmits := 0
 	replaced := false
+	var replacementHead int64
 	first.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		if req.Method == http.MethodPost && req.URL.Path == "/v1/events" {
 			eventSubmits++
@@ -1167,18 +1170,28 @@ func TestIntegrationInitialRecoveryDoesNotRescanReplacementIncarnation(t *testin
 				if err := second.RemoveRoot(context.Background(), rootDir2); err != nil {
 					t.Fatalf("second RemoveRoot: %v", err)
 				}
+				if err := os.RemoveAll(rootDir2); err != nil {
+					t.Fatalf("RemoveAll(second old incarnation): %v", err)
+				}
+				if err := os.MkdirAll(rootDir2, 0o755); err != nil {
+					t.Fatalf("MkdirAll(second replacement): %v", err)
+				}
 				if err := second.AddRoot(context.Background(), rootDir2); err != nil {
 					t.Fatalf("second replacement AddRoot: %v", err)
 				}
 				replaced = true
-				return nil, errors.New("initial upload failed after replacement")
+				replacementHead, err = h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+				if err != nil {
+					t.Fatalf("CurrentSeq(replacement): %v", err)
+				}
+				return http.DefaultTransport.RoundTrip(req)
 			}
 		}
 		return http.DefaultTransport.RoundTrip(req)
 	})
 	err = first.AddRoot(context.Background(), rootDir1)
-	if err == nil || !strings.Contains(err.Error(), "initial root upload") {
-		t.Fatalf("first AddRoot error = %v, want initial-upload error", err)
+	if err == nil || !strings.Contains(err.Error(), "root_incarnation_mismatch") {
+		t.Fatalf("first AddRoot error = %v, want incarnation-mismatch error", err)
 	}
 	if !replaced {
 		t.Fatal("test did not replace the root incarnation")
@@ -1200,6 +1213,9 @@ func TestIntegrationInitialRecoveryDoesNotRescanReplacementIncarnation(t *testin
 	beforeFlush, err := h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
 	if err != nil {
 		t.Fatalf("CurrentSeq(before): %v", err)
+	}
+	if beforeFlush != replacementHead {
+		t.Fatalf("replacement head advanced from %d to %d after rejected initial event", replacementHead, beforeFlush)
 	}
 	if err := first.flushPendingOps(context.Background()); err != nil {
 		t.Fatalf("flushPendingOps: %v", err)
@@ -2146,6 +2162,72 @@ func TestIntegrationConcurrentEditConflictCopy(t *testing.T) {
 	}
 	if !foundConflict {
 		t.Fatalf("expected conflict entry in second client state")
+	}
+}
+
+func TestIntegrationFileConflictRetainsStageWhenRestorationFails(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	filePath := filepath.Join(rootDir, "note.txt")
+	if err := os.WriteFile(filePath, []byte("only local copy\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(note): %v", err)
+	}
+	locked := false
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if !locked && req.Method == http.MethodGet && req.URL.Path == "/v1/events" {
+			locked = true
+			if err := os.Chmod(rootDir, 0); err != nil {
+				t.Fatalf("Chmod(lock root): %v", err)
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	item := scanner.Entry{
+		RelPath:       "note.txt",
+		AbsPath:       filePath,
+		Kind:          protocol.RootKindFile,
+		Mode:          0o644,
+		MTimeNS:       time.Now().UnixNano(),
+		ContentSHA256: "local",
+	}
+	err := d.resolveFileConflict(context.Background(), state.Root{
+		RootID:        "root-1",
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   "notes",
+		TargetAbsPath: rootDir,
+		State:         protocol.RootStateActive,
+	}, item, &PathConflictError{CurrentSeq: 999})
+	if chmodErr := os.Chmod(rootDir, 0o755); chmodErr != nil {
+		t.Fatalf("Chmod(unlock root): %v", chmodErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "restore staged local file") {
+		t.Fatalf("resolveFileConflict error = %v, want restoration failure", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(d.paths.StateDir, "syna-conflict-*"))
+	if err != nil {
+		t.Fatalf("Glob(staged files): %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("retained staged files = %v, want one", matches)
+	}
+	got, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("ReadFile(retained stage): %v", err)
+	}
+	if string(got) != "only local copy\n" {
+		t.Fatalf("retained stage contents = %q", string(got))
 	}
 }
 

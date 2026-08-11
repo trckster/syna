@@ -87,6 +87,15 @@ type PathConflictError struct {
 	PathID     string
 }
 
+type RootIncarnationConflictError struct {
+	ExpectedSeq int64
+	CurrentSeq  int64
+}
+
+func (e *RootIncarnationConflictError) Error() string {
+	return "root_incarnation_mismatch"
+}
+
 func (e *PathConflictError) Error() string {
 	return "path_head_mismatch"
 }
@@ -501,7 +510,7 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 	}
 	rootCreatedSeq = rootAddResp.AcceptedSeq
 
-	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, scan, progress, totals)
+	initialSync, err := d.submitInitialRootEntries(ctx, rootID, homeRelPath, rootCreatedSeq, scan, progress, totals)
 	if initialSync == nil {
 		initialSync = &initialRootSync{}
 	}
@@ -513,7 +522,18 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 		if !collided {
 			return fmt.Errorf("initial root upload: %w", err)
 		}
-		if recoveryErr := d.recoverInitialRootConflict(ctx, root, *initialSync.Conflict); recoveryErr != nil {
+		matched, remoteActive, verifyErr := d.verifyRootIncarnation(ctx, rootID, rootCreatedSeq)
+		if verifyErr != nil {
+			return fmt.Errorf("verify root before initial conflict recovery: %w", verifyErr)
+		}
+		if !remoteActive {
+			return fmt.Errorf("root %q is no longer active after initial sync", homeRelPath)
+		}
+		if !matched {
+			d.markStagedRoot(rootID)
+			return fmt.Errorf("root %q was replaced during initial sync", homeRelPath)
+		}
+		if recoveryErr := d.recoverInitialRootConflict(ctx, root, *initialSync.Conflict, rootCreatedSeq); recoveryErr != nil {
 			return fmt.Errorf("recover initial path conflict at %q: %w", initialSync.Conflict.Item.RelPath, recoveryErr)
 		}
 	}
@@ -533,7 +553,7 @@ func (d *Daemon) AddRootWithProgress(ctx context.Context, input string, progress
 			}
 			return replaceErr
 		}
-		if err := d.reconcileInitialRoot(ctx, rootID); err != nil {
+		if err := d.reconcileInitialRoot(ctx, rootID, rootCreatedSeq); err != nil {
 			return fmt.Errorf("reconcile initial path conflict: %w", err)
 		}
 	} else {
@@ -658,9 +678,9 @@ func (d *Daemon) initialSnapshotMatches(rootID string, sync *initialRootSync) (b
 	return true, nil
 }
 
-func (d *Daemon) recoverInitialRootConflict(ctx context.Context, root state.Root, collision initialRootConflict) error {
+func (d *Daemon) recoverInitialRootConflict(ctx context.Context, root state.Root, collision initialRootConflict, rootCreatedSeq int64) error {
 	if collision.Item.Kind == protocol.RootKindFile {
-		return d.resolveFileConflict(ctx, root, collision.Item, collision.Err)
+		return d.resolveFileConflictForIncarnation(ctx, root, collision.Item, collision.Err, rootCreatedSeq)
 	}
 	return d.resolveDirectoryConflict(ctx, root, collision.Item, collision.Err)
 }
@@ -689,7 +709,7 @@ func (d *Daemon) resolveDirectoryConflict(ctx context.Context, root state.Root, 
 
 var errRetryInitialReconcile = errors.New("retry initial reconciliation after applying a conflicting head")
 
-func (d *Daemon) reconcileInitialRoot(ctx context.Context, rootID string) error {
+func (d *Daemon) reconcileInitialRoot(ctx context.Context, rootID string, rootCreatedSeq int64) error {
 	root, err := d.stateDB.RootByID(rootID)
 	if err != nil {
 		return err
@@ -700,7 +720,7 @@ func (d *Daemon) reconcileInitialRoot(ctx context.Context, rootID string) error 
 	}
 	maxAttempts := len(scan.Entries)*2 + 16
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := d.rescanRootHintWithRetry(ctx, rootID, "", true, false, true)
+		err := d.rescanRootHintWithRetry(ctx, rootID, "", true, false, true, rootCreatedSeq)
 		if errors.Is(err, errRetryInitialReconcile) {
 			continue
 		}
@@ -1071,6 +1091,10 @@ func (d *Daemon) Status() (*protocol.WorkspaceStatus, error) {
 }
 
 func (d *Daemon) submitEvent(ctx context.Context, rootID, pathID string, rootKind protocol.RootKind, eventType protocol.EventType, baseSeq *int64, payload any, objectRefs []string) (*protocol.EventSubmitResponse, error) {
+	return d.submitEventForIncarnation(ctx, rootID, pathID, rootKind, eventType, baseSeq, 0, payload, objectRefs)
+}
+
+func (d *Daemon) submitEventForIncarnation(ctx context.Context, rootID, pathID string, rootKind protocol.RootKind, eventType protocol.EventType, baseSeq *int64, rootCreatedSeq int64, payload any, objectRefs []string) (*protocol.EventSubmitResponse, error) {
 	plain, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -1088,8 +1112,14 @@ func (d *Daemon) submitEvent(ctx context.Context, rootID, pathID string, rootKin
 		PayloadBlob: commoncrypto.Base64Raw(blob),
 		ObjectRefs:  objectRefs,
 	}
+	if rootCreatedSeq > 0 {
+		req.RootCreatedSeq = &rootCreatedSeq
+	}
 	resp, apiErr, err := d.conn.SubmitEvent(ctx, req)
 	if err != nil {
+		if apiErr != nil && apiErr.Code == "root_incarnation_mismatch" {
+			return nil, &RootIncarnationConflictError{ExpectedSeq: rootCreatedSeq, CurrentSeq: apiErr.CurrentSeq}
+		}
 		if apiErr != nil && apiErr.Code == "path_head_mismatch" {
 			return nil, &PathConflictError{CurrentSeq: apiErr.CurrentSeq, PathID: pathID}
 		}
@@ -1785,6 +1815,9 @@ func (d *Daemon) watchLoop(ctx context.Context) {
 				defer d.syncMu.Unlock()
 				d.mu.Lock()
 				defer d.mu.Unlock()
+				if d.isRootStaged(rootID) {
+					return
+				}
 				if err := d.rescanRootHint(ctx, rootID, hint); err != nil {
 					d.logger.Printf("rescan %s (%s): %v", rootID, hint, err)
 				}
@@ -1799,14 +1832,14 @@ func (d *Daemon) rescanRoot(ctx context.Context, rootID string) error {
 }
 
 func (d *Daemon) rescanRootHint(ctx context.Context, rootID, relPathHint string) error {
-	return d.rescanRootHintWithRetry(ctx, rootID, relPathHint, true, true, false)
+	return d.rescanRootHintWithRetry(ctx, rootID, relPathHint, true, true, false, 0)
 }
 
 func (d *Daemon) rescanRootWithRetry(ctx context.Context, rootID string, allowRetry bool, queueRetryable bool) error {
-	return d.rescanRootHintWithRetry(ctx, rootID, "", allowRetry, queueRetryable, false)
+	return d.rescanRootHintWithRetry(ctx, rootID, "", allowRetry, queueRetryable, false, 0)
 }
 
-func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHint string, allowRetry bool, queueRetryable bool, forceEntries bool) error {
+func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHint string, allowRetry bool, queueRetryable bool, forceEntries bool, expectedRootSeq int64) error {
 	root, err := d.stateDB.RootByID(rootID)
 	if err != nil {
 		return err
@@ -1854,7 +1887,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			continue
 		}
 		payload := protocol.DeletePayload{Path: relPath}
-		resp, err := d.submitEvent(ctx, rootID, old.PathID, "", protocol.EventDelete, &old.CurrentSeq, payload, nil)
+		resp, err := d.submitEventForIncarnation(ctx, rootID, old.PathID, "", protocol.EventDelete, &old.CurrentSeq, expectedRootSeq, payload, nil)
 		if err != nil {
 			if allowRetry {
 				var conflict *PathConflictError
@@ -1862,7 +1895,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 					if err := d.applyCurrentRemoteHead(ctx, conflict.CurrentSeq); err != nil {
 						return err
 					}
-					return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, forceEntries)
+					return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, forceEntries, expectedRootSeq)
 				}
 			}
 			if queueRetryable && isRetryableSyncError(err) {
@@ -1903,7 +1936,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 				}
 				continue
 			}
-			resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventDirPut, &baseSeq, protocol.DirPutPayload{
+			resp, err := d.submitEventForIncarnation(ctx, rootID, pathID, "", protocol.EventDirPut, &baseSeq, expectedRootSeq, protocol.DirPutPayload{
 				Path:    item.RelPath,
 				Mode:    item.Mode,
 				MTimeNS: item.MTimeNS,
@@ -1918,7 +1951,7 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 						return errRetryInitialReconcile
 					}
 					if allowRetry {
-						return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, false)
+						return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, false, expectedRootSeq)
 					}
 					continue
 				}
@@ -1957,18 +1990,18 @@ func (d *Daemon) rescanRootHintWithRetry(ctx context.Context, rootID, relPathHin
 			}
 			return err
 		}
-		resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventFilePut, &baseSeq, up.Payload, up.Refs)
+		resp, err := d.submitEventForIncarnation(ctx, rootID, pathID, "", protocol.EventFilePut, &baseSeq, expectedRootSeq, up.Payload, up.Refs)
 		if err != nil {
 			var conflict *PathConflictError
 			if errors.As(err, &conflict) {
-				if err := d.resolveFileConflict(ctx, *root, item, conflict); err != nil {
+				if err := d.resolveFileConflictForIncarnation(ctx, *root, item, conflict, expectedRootSeq); err != nil {
 					return err
 				}
 				if forceEntries {
 					return errRetryInitialReconcile
 				}
 				if allowRetry {
-					return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, false)
+					return d.rescanRootHintWithRetry(ctx, rootID, subtreeHint, false, queueRetryable, false, expectedRootSeq)
 				}
 				continue
 			}
@@ -2387,7 +2420,7 @@ func (d *Daemon) recoverPendingInitialRoot(ctx context.Context, op state.Pending
 		d.markStagedRoot(op.RootID)
 		return true, nil
 	}
-	if err := d.reconcileInitialRoot(ctx, op.RootID); err != nil {
+	if err := d.reconcileInitialRoot(ctx, op.RootID, remoteSeq); err != nil {
 		return false, err
 	}
 	current, err := d.stateDB.RootByID(op.RootID)
@@ -2414,6 +2447,9 @@ func (d *Daemon) queuePendingRootRescan(rootID string, cause error) error {
 }
 
 func (d *Daemon) markStagedRoot(rootID string) {
+	if d.watcher != nil {
+		d.watcher.RemoveRoot(rootID)
+	}
 	d.stageMu.Lock()
 	defer d.stageMu.Unlock()
 	d.stagedRoots[rootID] = struct{}{}
