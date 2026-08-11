@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -54,11 +55,13 @@ type Daemon struct {
 	reconnectLoopID       int64
 	stagedRoots           map[string]struct{}
 	streamingLive         bool
+	purgeTransition       bool
 }
 
 type ConnectRequest struct {
 	ServerURL   string `json:"server_url"`
 	RecoveryKey string `json:"recovery_key,omitempty"`
+	Recreate    bool   `json:"recreate,omitempty"`
 }
 
 type ConnectResponse struct {
@@ -142,6 +145,17 @@ func New(paths commoncfg.ClientPaths, logger *log.Logger) (*Daemon, error) {
 	if err := stateDB.Migrate(); err != nil {
 		return nil, err
 	}
+	workspaceState, err := stateDB.LoadWorkspaceState()
+	if err != nil {
+		return nil, err
+	}
+	if workspaceState.ConnectionState == protocol.ConnectionWorkspacePurged && (cfg.ServerURL != "" || cfg.WorkspaceID != "") {
+		cfg.ServerURL = ""
+		cfg.WorkspaceID = ""
+		if err := configs.SaveConfig(cfg); err != nil {
+			return nil, fmt.Errorf("finish purged workspace recovery: %w", err)
+		}
+	}
 	d := &Daemon{
 		paths:       paths,
 		configs:     configs,
@@ -172,8 +186,8 @@ func New(paths commoncfg.ClientPaths, logger *log.Logger) (*Daemon, error) {
 			logger.Printf("configured server URL rejected: %v", err)
 		} else {
 			d.conn = connector.New(cfg.ServerURL)
-			if st, err := stateDB.LoadWorkspaceState(); err == nil && st.SessionToken != "" {
-				d.conn = d.conn.WithToken(st.SessionToken)
+			if workspaceState.SessionToken != "" {
+				d.conn = d.conn.WithToken(workspaceState.SessionToken)
 			}
 		}
 	}
@@ -238,6 +252,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.purgeTransition {
+		return nil, errors.New("workspace purge transition is still being finalized")
+	}
 
 	if d.cfg.ServerURL != "" && d.cfg.ServerURL != req.ServerURL {
 		return nil, fmt.Errorf("already connected to %s; run `syna disconnect` first", d.cfg.ServerURL)
@@ -253,6 +270,7 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 		err        error
 	)
 	createIfMissing := false
+	generatedKey := false
 	if req.RecoveryKey != "" {
 		displayKey = req.RecoveryKey
 		rawKey, err = commoncrypto.ParseRecoveryKey(req.RecoveryKey)
@@ -260,10 +278,17 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 			return nil, err
 		}
 	} else {
+		if req.Recreate {
+			return nil, errors.New("recreating a workspace requires the retained recovery key")
+		}
 		displayKey, rawKey, err = commoncrypto.GenerateRecoveryKey()
 		if err != nil {
 			return nil, err
 		}
+		createIfMissing = true
+		generatedKey = true
+	}
+	if req.Recreate {
 		createIfMissing = true
 	}
 	keys, err := commoncrypto.Derive(rawKey)
@@ -330,7 +355,7 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 	d.startReconnectLoopLocked()
 	return &ConnectResponse{
 		WorkspaceID:          workspaceID,
-		GeneratedRecoveryKey: map[bool]string{true: displayKey, false: ""}[createIfMissing],
+		GeneratedRecoveryKey: map[bool]string{true: displayKey, false: ""}[generatedKey],
 		Warnings:             warnings,
 	}, nil
 }
@@ -870,6 +895,16 @@ func (d *Daemon) reconnectLoop(ctx context.Context) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
+			discarded, discardErr := d.discardRejectedCachedSession(err)
+			if discardErr != nil {
+				err = fmt.Errorf("clear rejected session: %w", discardErr)
+			} else if discarded {
+				continue
+			}
+			if connector.IsHTTPError(err, http.StatusNotFound, "workspace_not_found") {
+				d.finishPurgedWorkspace(ctx)
+				return
+			}
 			_ = d.stateDB.SetConnectionStateWithKind(protocol.ConnectionDegraded, lifecycleKind(err, protocol.IssueTransport), err.Error())
 			sleep := jitter(backoff)
 			timer := time.NewTimer(sleep)
@@ -893,6 +928,82 @@ func (d *Daemon) reconnectLoop(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+func (d *Daemon) discardRejectedCachedSession(syncErr error) (bool, error) {
+	if !connector.IsHTTPError(syncErr, http.StatusUnauthorized, "") {
+		return false, nil
+	}
+	workspaceState, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		return false, err
+	}
+	if workspaceState.SessionToken == "" {
+		return false, nil
+	}
+	if err := d.stateDB.ClearSession(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (d *Daemon) finishPurgedWorkspace(ctx context.Context) {
+	d.mu.Lock()
+	d.purgeTransition = true
+	d.mu.Unlock()
+	backoff := time.Second
+	for {
+		if err := d.handlePurgedWorkspace(); err == nil {
+			d.mu.Lock()
+			d.purgeTransition = false
+			d.mu.Unlock()
+			return
+		} else {
+			d.logger.Printf("handle purged workspace: %v", err)
+		}
+		timer := time.NewTimer(jitter(backoff))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if backoff < 60*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (d *Daemon) handlePurgedWorkspace() error {
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	roots, err := d.stateDB.ListRoots()
+	if err != nil {
+		return err
+	}
+	for _, root := range roots {
+		d.watcher.RemoveRoot(root.RootID)
+	}
+	if err := d.stateDB.ClearPurgedWorkspace(); err != nil {
+		return err
+	}
+	nextConfig := d.cfg
+	nextConfig.ServerURL = ""
+	nextConfig.WorkspaceID = ""
+	if err := d.configs.SaveConfig(nextConfig); err != nil {
+		return err
+	}
+	d.cfg = nextConfig
+	d.intentionalDisconnect = true
+	d.keys = nil
+	d.conn = nil
+	// Allow an explicit recreate RPC to start a replacement loop before the
+	// current reconnect goroutine's wrapper has returned. Its loop ID prevents
+	// the old wrapper from clearing the replacement cancel function.
+	d.reconnectCancel = nil
+	return nil
 }
 
 func (d *Daemon) syncAndStream(ctx context.Context) error {

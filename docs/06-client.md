@@ -161,6 +161,13 @@ Behavior:
 - leave local synced files on disk untouched
 - do not modify the server workspace or other clients
 
+### `syna connect --recreate <server-url>`
+
+After an operator purges a workspace, clients stop syncing, clear their local
+sync indexes, and retain plaintext files and the recovery key. This explicit
+command uses that retained key to create a fresh empty workspace. It never
+restores the purged server history, and tracked roots must be added again.
+
 A later reconnect is treated as a fresh device join, so existing local targets are checked with the normal bootstrap blocking rules.
 
 ### `syna add <path>`
@@ -246,11 +253,14 @@ States:
 - `catching_up`
 - `live`
 - `degraded`
+- `workspace_purged`
 
 Rules:
 
 - only `live` means the websocket is healthy and catch-up is complete
 - `degraded` means local watching continues and ops queue locally, but the server connection is unhealthy
+- `workspace_purged` is terminal: watching and reconnect attempts stop, sync
+  indexes are cleared, and the recovery key and plaintext files remain available
 
 ## Add Root Algorithm
 

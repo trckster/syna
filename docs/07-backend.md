@@ -213,6 +213,7 @@ syna-server migrate
 syna-server gc
 syna-server stats
 syna-server doctor
+syna-server purge-workspace <workspace-id>
 ```
 
 Expected behavior:
@@ -222,6 +223,8 @@ Expected behavior:
 - `gc`: run one compaction and GC pass, then exit
 - `stats`: print workspace, object, and sequence counts
 - `doctor`: verify DB accessibility, object paths, and schema version
+- `purge-workspace`: while the server is stopped, irreversibly delete the
+  selected workspace's database rows and exclusively owned encrypted objects
 
 ## Health Endpoints
 

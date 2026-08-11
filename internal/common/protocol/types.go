@@ -20,6 +20,7 @@ const (
 	ConnectionLive            ConnectionState = "live"
 	ConnectionBlockedNonEmpty ConnectionState = "blocked_nonempty"
 	ConnectionDegraded        ConnectionState = "degraded"
+	ConnectionWorkspacePurged ConnectionState = "workspace_purged"
 )
 
 type DaemonIssueKind string
@@ -33,6 +34,7 @@ const (
 	IssueWatcher        DaemonIssueKind = "watcher"
 	IssueTransport      DaemonIssueKind = "transport"
 	IssueScanner        DaemonIssueKind = "scanner"
+	IssueWorkspaceGone  DaemonIssueKind = "workspace_purged"
 )
 
 type EventType string

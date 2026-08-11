@@ -19,6 +19,7 @@ import (
 	"syna/internal/server/db"
 	"syna/internal/server/hub"
 	"syna/internal/server/objectstore"
+	"syna/internal/server/processlock"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -40,6 +41,14 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := servercfg.EnsureDataDirs(cfg.DataDir); err != nil {
 		return fail(stderr, err)
+	}
+	var dataLock *processlock.Lock
+	if commandUsesDataDir(args[1]) {
+		dataLock, err = processlock.Acquire(cfg.DataDir)
+		if err != nil {
+			return fail(stderr, err)
+		}
+		defer func() { _ = dataLock.Close() }()
 	}
 	database, err := db.Open(filepath.Join(cfg.DataDir, "state.db"))
 	if err != nil {
@@ -65,14 +74,35 @@ func Main(args []string, stdout, stderr io.Writer) int {
 			return fail(stderr, err)
 		}
 		return exitErr(stderr, admin.GC(database, objectstore.New(cfg.DataDir), time.Now().UTC(), cfg.EventRetention, cfg.ZeroRefRetention))
+	case "purge-workspace":
+		if len(args) != 3 {
+			usage(stdout)
+			return 2
+		}
+		if err := database.Migrate(); err != nil {
+			return fail(stderr, err)
+		}
+		return exitErr(stderr, admin.PurgeWorkspace(database, objectstore.New(cfg.DataDir), cfg.DataDir, args[2], stdout))
 	case "serve":
 		if err := database.Migrate(); err != nil {
+			return fail(stderr, err)
+		}
+		if err := admin.RecoverPurgeStaging(database, objectstore.New(cfg.DataDir), cfg.DataDir); err != nil {
 			return fail(stderr, err)
 		}
 		return exitErr(stderr, runServer(cfg, database, stdout))
 	default:
 		usage(stdout)
 		return 2
+	}
+}
+
+func commandUsesDataDir(command string) bool {
+	switch command {
+	case "migrate", "stats", "doctor", "gc", "serve", "purge-workspace":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -108,7 +138,7 @@ func runServer(cfg servercfg.Config, database *db.DB, output io.Writer) error {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: syna-server <serve|migrate|gc|stats|doctor|version>")
+	_, _ = fmt.Fprintln(w, "usage: syna-server <serve|migrate|gc|stats|doctor|purge-workspace <workspace-id>|version>")
 }
 
 func exitErr(stderr io.Writer, err error) int {

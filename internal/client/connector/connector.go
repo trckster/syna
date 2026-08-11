@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,27 @@ type Client struct {
 	BaseURL    string
 	Token      string
 	HTTPClient *http.Client
+}
+
+type HTTPError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Code != "" {
+		return e.Code
+	}
+	return fmt.Sprintf("http %d", e.StatusCode)
+}
+
+func IsHTTPError(err error, statusCode int, code string) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == statusCode && (code == "" || httpErr.Code == code)
 }
 
 func New(baseURL string) *Client {
@@ -167,7 +189,11 @@ func (c *Client) DialWS(ctx context.Context) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set(protocol.VersionHeader, "1")
 	header.Set("Authorization", "Bearer "+c.Token)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
+	if err != nil && resp != nil {
+		defer func() { _ = resp.Body.Close() }()
+		return nil, responseError("open websocket", resp)
+	}
 	return conn, err
 }
 
@@ -202,17 +228,12 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
+		parsed := protocol.ErrorResponse{}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&parsed)
 		if apiErr != nil {
-			_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(apiErr)
-			if apiErr.Message != "" {
-				return fmt.Errorf("%s", apiErr.Message)
-			}
-			if apiErr.Code == "" {
-				return fmt.Errorf("http %d", resp.StatusCode)
-			}
-			return fmt.Errorf("%s", apiErr.Code)
+			*apiErr = parsed
 		}
-		return fmt.Errorf("http %d", resp.StatusCode)
+		return &HTTPError{StatusCode: resp.StatusCode, Code: parsed.Code, Message: parsed.Message}
 	}
 	if respBody != nil {
 		return json.NewDecoder(resp.Body).Decode(respBody)
@@ -223,8 +244,17 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 func responseError(operation string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	message := strings.TrimSpace(string(body))
-	if message == "" {
-		return fmt.Errorf("%s: http %d", operation, resp.StatusCode)
+	parsed := protocol.ErrorResponse{}
+	if json.Unmarshal(body, &parsed) == nil && (parsed.Code != "" || parsed.Message != "") {
+		if parsed.Message == "" {
+			parsed.Message = parsed.Code
+		}
+		return &HTTPError{StatusCode: resp.StatusCode, Code: parsed.Code, Message: operation + ": " + parsed.Message}
 	}
-	return fmt.Errorf("%s: http %d: %s", operation, resp.StatusCode, message)
+	if message != "" {
+		message = operation + ": " + message
+	} else {
+		message = fmt.Sprintf("%s: http %d", operation, resp.StatusCode)
+	}
+	return &HTTPError{StatusCode: resp.StatusCode, Message: message}
 }

@@ -74,6 +74,8 @@ Enter the recovery key from the first device when prompted.
 
 ```text
 syna connect <server-url>   Connect this device to a Syna server
+syna connect --recreate <server-url>
+                            Recreate a purged workspace with its retained key
 syna disconnect             Disconnect this device and stop local sync
 syna key show               Print the stored workspace recovery key
 syna add <path>             Start syncing a file or directory
@@ -118,8 +120,14 @@ syna-server migrate
 syna-server gc
 syna-server stats
 syna-server doctor
+syna-server purge-workspace <workspace-id>
 syna-server version
 ```
+
+`purge-workspace` irreversibly deletes one workspace's server-side metadata and
+encrypted objects. Stop `syna-server serve` before running it. Get the workspace
+ID from `syna status` on a connected client. Other workspaces and shared object
+blobs are preserved.
 
 See [`deploy/README.md`](./deploy/README.md) for Docker Compose, Coolify,
 reverse-proxy, backup, restore, and upgrade guidance.

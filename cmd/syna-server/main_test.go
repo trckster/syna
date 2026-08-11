@@ -17,6 +17,7 @@ import (
 	"syna/internal/client/connector"
 	commoncrypto "syna/internal/common/crypto"
 	"syna/internal/common/protocol"
+	serverdb "syna/internal/server/db"
 )
 
 func TestServerProcessSessionEventsBootstrapAndWebSocket(t *testing.T) {
@@ -52,6 +53,16 @@ func TestServerProcessSessionEventsBootstrapAndWebSocket(t *testing.T) {
 	waitForHTTP(t, baseURL+"/healthz", 5*time.Second)
 
 	conn, workspaceID := authenticatedConnector(t, baseURL)
+	purgeCmd := exec.Command(bin, "purge-workspace", workspaceID)
+	purgeCmd.Env = append(filteredServerEnv("SYNA_DATA_DIR"), "SYNA_DATA_DIR="+dataDir)
+	if output, err := purgeCmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "server is using data directory") {
+		t.Fatalf("purge should fail while serve owns the data directory: err=%v output=%s", err, output)
+	}
+	gcCmd := exec.Command(bin, "gc")
+	gcCmd.Env = append(filteredServerEnv("SYNA_DATA_DIR"), "SYNA_DATA_DIR="+dataDir)
+	if output, err := gcCmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "server is using data directory") {
+		t.Fatalf("gc should fail while serve owns the data directory: err=%v output=%s", err, output)
+	}
 	ws, err := conn.DialWS(context.Background())
 	if err != nil {
 		t.Fatalf("DialWS: %v", err)
@@ -104,6 +115,47 @@ func TestServerProcessSessionEventsBootstrapAndWebSocket(t *testing.T) {
 	}
 	if msg.Type != "event" || msg.Event == nil || msg.Event.Seq != rootAdd.AcceptedSeq {
 		t.Fatalf("unexpected websocket message: %+v", msg)
+	}
+}
+
+func TestServerProcessPurgesWorkspaceByPassedID(t *testing.T) {
+	bin := buildServerBinary(t)
+	dataDir := shortServerTempDir(t, "purge-data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(data): %v", err)
+	}
+	database, err := serverdb.Open(filepath.Join(dataDir, "state.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	if err := database.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	workspaceID := strings.Repeat("a", 32)
+	if _, err := database.EnsureWorkspace(workspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(database): %v", err)
+	}
+
+	cmd := exec.Command(bin, "purge-workspace", workspaceID)
+	cmd.Env = append(filteredServerEnv("SYNA_DATA_DIR"), "SYNA_DATA_DIR="+dataDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("purge-workspace: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "workspace_id: "+workspaceID) {
+		t.Fatalf("unexpected purge output:\n%s", output)
+	}
+
+	database, err = serverdb.Open(filepath.Join(dataDir, "state.db"))
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	if _, err := database.WorkspacePubKey(workspaceID); err == nil {
+		t.Fatal("workspace still exists after purge")
 	}
 }
 

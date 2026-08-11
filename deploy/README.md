@@ -98,6 +98,9 @@ Your reverse proxy must provide:
   submissions; file chunks are limited to 4 MiB plaintext and snapshot objects
   to 16 MiB plaintext before encryption overhead
 - long-lived idle connections
+- Offline workspace removal is available with
+  `syna-server purge-workspace <workspace-id>`. Stop the serving container first;
+  the command refuses to run while the data directory is in use.
 
 Do not expose the raw backend listener directly to the public internet. Bind it
 to localhost or a private interface and publish only the HTTPS reverse-proxy
@@ -114,8 +117,9 @@ Recommended backup flow:
 Restore flow:
 
 1. Restore the archived directory back to `/var/lib/syna`.
-2. Start the same or a newer compatible `syna-server` build.
-3. Run `syna-server doctor` and confirm `/readyz` returns `200`.
+2. Run `syna-server doctor` with the serving process stopped.
+3. Start the same or a newer compatible `syna-server` build and confirm
+   `/readyz` returns `200`.
 
 Because payloads are end-to-end encrypted, server backups are still encrypted at rest, but they remain operationally sensitive and should still be protected.
 
@@ -141,10 +145,10 @@ Recommended upgrade flow:
 2. Build the new server image from the updated repository checkout, or pull it
    from your own registry if you publish one.
 3. Stop the old container.
-4. Start the new container against the same mounted volume.
-5. Verify `/readyz`.
-6. Run `syna-server doctor`.
-7. Optionally run `syna-server gc` after the upgrade window.
+4. Run `syna-server doctor` and, optionally, `syna-server gc` from the new image
+   while the serving process remains stopped.
+5. Start the new container against the same mounted volume.
+6. Verify `/readyz`.
 
 Rolling or active-active upgrades are not supported in v1.
 
