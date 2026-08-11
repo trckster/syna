@@ -57,6 +57,26 @@ func TestFilterEntriesByHint(t *testing.T) {
 	}
 }
 
+func TestConsumeNoOpLifecycleEventAdvancesCursor(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	if err := d.consumeRemoteEvent(context.Background(), protocol.EventRecord{
+		Seq:       9,
+		RootID:    "unknown-root",
+		EventType: protocol.EventRootRemove,
+	}); err != nil {
+		t.Fatalf("consumeRemoteEvent: %v", err)
+	}
+	st, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq != 9 {
+		t.Fatalf("last server seq = %d want 9", st.LastServerSeq)
+	}
+}
+
 func TestRootForRemoveReportsUntrackedPath(t *testing.T) {
 	roots := []state.Root{
 		{

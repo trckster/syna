@@ -168,3 +168,28 @@ func TestIgnoreRuleStoresExpectedState(t *testing.T) {
 		t.Fatalf("expected delete ignore rule, got %+v", deleteRule)
 	}
 }
+
+func TestAdvanceLastSeqNeverRegresses(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "client.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	if err := db.AdvanceLastSeq(42); err != nil {
+		t.Fatalf("AdvanceLastSeq(42): %v", err)
+	}
+	if err := db.AdvanceLastSeq(41); err != nil {
+		t.Fatalf("AdvanceLastSeq(41): %v", err)
+	}
+	st, err := db.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq != 42 {
+		t.Fatalf("last server seq = %d want 42", st.LastServerSeq)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +41,14 @@ type restartableHarness struct {
 }
 
 func newIntegrationHarness(t *testing.T) *integrationHarness {
+	return newIntegrationHarnessWithMaxEventFetchPage(t, 1000)
+}
+
+func newIntegrationHarnessWithMaxEventFetchPage(t *testing.T, maxEventFetchPage int) *integrationHarness {
+	return newIntegrationHarnessWithObserver(t, maxEventFetchPage, nil)
+}
+
+func newIntegrationHarnessWithObserver(t *testing.T, maxEventFetchPage int, observe func(string)) *integrationHarness {
 	t.Helper()
 
 	dataDir := filepath.Join(t.TempDir(), "server")
@@ -59,14 +68,22 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 		EventRetention:    24 * time.Hour,
 		ZeroRefRetention:  24 * time.Hour,
 		AllowHTTP:         true,
-		MaxEventFetchPage: 1000,
+		MaxEventFetchPage: maxEventFetchPage,
 		MaxPlainChunkSize: 4 << 20,
 		MaxEventBodyBytes: 1 << 20,
 		MaxSnapshotBody:   16 << 20,
 		MaxSnapshotPlain:  16 << 20,
 		MaxWSClients:      8,
 	}
-	server := httptest.NewServer(api.New(cfg, database, objectstore.New(dataDir), hub.New(cfg.MaxWSClients, log.New(io.Discard, "", 0)), log.New(io.Discard, "", 0)).Handler())
+	handler := api.New(cfg, database, objectstore.New(dataDir), hub.New(cfg.MaxWSClients, log.New(io.Discard, "", 0)), log.New(io.Discard, "", 0)).Handler()
+	if observe != nil {
+		next := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			observe(r.URL.Path)
+			next.ServeHTTP(w, r)
+		})
+	}
+	server := httptest.NewServer(handler)
 	return &integrationHarness{
 		serverURL: server.URL,
 		dataDir:   dataDir,
@@ -338,6 +355,26 @@ func TestIntegrationJoinBootstrapsExistingWorkspaceDuringConnect(t *testing.T) {
 	}
 }
 
+func TestIntegrationConnectDoesNotReportLiveBeforeWebsocket(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	status, err := d.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Connection == protocol.ConnectionLive {
+		t.Fatal("connect reported live before a WebSocket subscription was established")
+	}
+}
+
 func TestIntegrationReplayOwnRootAddKeepsRootActive(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()
@@ -378,8 +415,18 @@ func TestIntegrationReplayOwnRootAddKeepsRootActive(t *testing.T) {
 	if rootAdd == nil {
 		t.Fatalf("expected root_add event")
 	}
-	if err := d.applyRemoteEvent(context.Background(), *rootAdd); err != nil {
+	if _, err := d.stateDB.SQL.Exec(`UPDATE workspace_state SET last_server_seq = 0 WHERE singleton = 1`); err != nil {
+		t.Fatalf("reset last_server_seq: %v", err)
+	}
+	if err := d.consumeRemoteEvent(context.Background(), *rootAdd); err != nil {
 		t.Fatalf("apply own root_add: %v", err)
+	}
+	st, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq < rootAdd.Seq {
+		t.Fatalf("root_add did not advance cursor: got %d want at least %d", st.LastServerSeq, rootAdd.Seq)
 	}
 	root, err := d.stateDB.RootByHomeRel("notes")
 	if err != nil {
@@ -387,6 +434,140 @@ func TestIntegrationReplayOwnRootAddKeepsRootActive(t *testing.T) {
 	}
 	if root.State != protocol.RootStateActive {
 		t.Fatalf("own root_add replay changed root state to %q", root.State)
+	}
+}
+
+func TestIntegrationCatchUpPaginatesThroughServerLimit(t *testing.T) {
+	h := newIntegrationHarnessWithMaxEventFetchPage(t, 1)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := first.AddRoot(context.Background(), rootDir1); err != nil {
+		t.Fatalf("first AddRoot: %v", err)
+	}
+
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	for _, name := range []string{"one.txt", "two.txt"} {
+		if err := os.WriteFile(filepath.Join(rootDir1, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel(first): %v", err)
+	}
+	if err := first.rescanRoot(context.Background(), root.RootID); err != nil {
+		t.Fatalf("first rescanRoot: %v", err)
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second bootstrapOrCatchUp: %v", err)
+	}
+
+	for _, name := range []string{"one.txt", "two.txt"} {
+		got, err := os.ReadFile(filepath.Join(home2, "notes", name))
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", name, err)
+		}
+		if string(got) != name+"\n" {
+			t.Fatalf("contents of %s = %q", name, string(got))
+		}
+	}
+	st, err := second.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState(second): %v", err)
+	}
+	current, err := h.serverDB.CurrentSeq(second.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq: %v", err)
+	}
+	if st.LastServerSeq != current {
+		t.Fatalf("last server seq = %d want %d", st.LastServerSeq, current)
+	}
+}
+
+func TestIntegrationSubscribesBeforeCatchUpAndLive(t *testing.T) {
+	var (
+		requestMu sync.Mutex
+		requests  []string
+	)
+	h := newIntegrationHarnessWithObserver(t, 1000, func(path string) {
+		if path != "/v1/ws" && path != "/v1/events" {
+			return
+		}
+		requestMu.Lock()
+		requests = append(requests, path)
+		requestMu.Unlock()
+	})
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancelDaemon := newTestDaemon(t)
+	defer cancelDaemon()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.syncAndStream(ctx)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		status, err := d.Status()
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		requestMu.Lock()
+		requestCount := len(requests)
+		requestMu.Unlock()
+		if requestCount >= 2 && status.Connection == protocol.ConnectionLive {
+			ready = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ready {
+		t.Fatal("syncAndStream did not subscribe and catch up in time")
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("syncAndStream did not stop after cancellation")
+	}
+
+	requestMu.Lock()
+	got := append([]string(nil), requests...)
+	requestMu.Unlock()
+	if len(got) < 2 {
+		t.Fatalf("expected websocket and catch-up requests, got %v", got)
+	}
+	if got[0] != "/v1/ws" {
+		t.Fatalf("first live-sync request = %q want /v1/ws; requests=%v", got[0], got)
 	}
 }
 
@@ -421,6 +602,60 @@ func TestIntegrationStatusSurfacesScannerWarnings(t *testing.T) {
 	}
 	if len(status.Issues) != 1 || status.Issues[0].Kind != protocol.IssueScanner {
 		t.Fatalf("expected structured scanner issue, got %+v", status.Issues)
+	}
+}
+
+func TestIntegrationDirectoryMTimeOnlyDoesNotPublishEcho(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(note): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	root, err := d.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	before, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(before): %v", err)
+	}
+
+	wantMTime := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(rootDir, wantMTime, wantMTime); err != nil {
+		t.Fatalf("Chtimes(root): %v", err)
+	}
+	if err := d.rescanRoot(context.Background(), root.RootID); err != nil {
+		t.Fatalf("rescanRoot: %v", err)
+	}
+	after, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(after): %v", err)
+	}
+	if after != before {
+		t.Fatalf("directory mtime echo advanced server sequence from %d to %d", before, after)
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		t.Fatalf("EntriesForRoot: %v", err)
+	}
+	if got := entries[""].MTimeNS; got != wantMTime.UnixNano() {
+		t.Fatalf("local directory mtime baseline = %d want %d", got, wantMTime.UnixNano())
 	}
 }
 

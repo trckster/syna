@@ -166,9 +166,9 @@ Bootstrap sequence:
 
 1. download latest root snapshots and descriptors
 2. decrypt each snapshot locally and materialize or stage all unblocked roots
-3. fetch retained events once from the workspace-global bootstrap cursor
+3. fetch all retained-event pages from the workspace-global bootstrap cursor
 4. replay those events in sequence order
-5. open live WebSocket subscription
+5. continue from the live WebSocket subscription opened before bootstrap began
 
 ## Local Process Model
 
@@ -199,14 +199,16 @@ It uses:
 - HTTPS for session start and finish
 - HTTPS for bootstrap, event fetch, and event submit
 - HTTPS for object upload and object download
-- WebSocket for newly accepted events after catch-up completes
+- WebSocket for notifications about newly accepted events, subscribed before catch-up begins
 
 The steady-state rule is:
 
 1. establish or renew the HTTP bearer-token session
-2. catch up missing history with `/v1/events`, or fall back to `/v1/bootstrap` if required
-3. open the WebSocket live feed
-4. keep reconnecting with backoff if the socket or session fails
+2. open the WebSocket subscription so new events are buffered
+3. flush pending offline rescans so conflicts preserve local bytes
+4. catch up missing history with `/v1/events`, or fall back to `/v1/bootstrap` if required
+5. reconcile local roots and catch up again before reporting `live`
+6. keep reconnecting with backoff if the socket or session fails
 
 ## Restart And Reboot Flow
 
@@ -216,10 +218,13 @@ When the Linux user service starts `syna daemon` after login or reboot, the daem
 2. bind `~/.local/state/syna/agent.sock`
 3. restore active roots, blocked roots, and pending operations from the local DB
 4. authenticate to the server and refresh the session if needed
-5. catch up remote state with `/v1/events`, or run `/v1/bootstrap` if incremental catch-up is no longer valid
-6. reconcile every active root against local disk so changes made while the daemon was not running are turned into pending operations rather than missed
-7. install recursive watchers for active roots
-8. enter `live` state only after catch-up and reconciliation complete
+5. open the WebSocket subscription
+6. flush pending offline rescans and preserve any path-head conflicts
+7. catch up remote state with `/v1/events`, or run `/v1/bootstrap` if incremental catch-up is no longer valid
+8. reconcile every active root against local disk so changes made while the daemon was not running are turned into pending operations rather than missed
+9. catch up events accepted during reconciliation
+10. install recursive watchers for active roots
+11. enter `live` state only after catch-up and reconciliation complete
 
 If remote catch-up and startup reconciliation both produce a change for the same path, the daemon must preserve both versions using the normal conflict-file rule. Restart must never silently discard local bytes.
 

@@ -3,6 +3,7 @@ package api
 import (
 	"log"
 	"net/http"
+	"sync"
 
 	servercfg "syna/internal/server/config"
 	"syna/internal/server/db"
@@ -11,11 +12,12 @@ import (
 )
 
 type API struct {
-	cfg    servercfg.Config
-	db     *db.DB
-	store  *objectstore.Store
-	hub    *hub.Hub
-	logger *log.Logger
+	cfg     servercfg.Config
+	db      *db.DB
+	store   *objectstore.Store
+	hub     *hub.Hub
+	logger  *log.Logger
+	eventMu sync.Mutex
 }
 
 func New(cfg servercfg.Config, database *db.DB, store *objectstore.Store, eventHub *hub.Hub, logger *log.Logger) *API {

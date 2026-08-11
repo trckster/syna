@@ -63,10 +63,12 @@ Every daemon start, including reboot recovery, must:
 3. bind `agent.sock`
 4. restore tracked roots and pending operations from `client.db`
 5. authenticate and re-establish the server session
-6. catch up from `/v1/events`, or fall back to `/v1/bootstrap` if the cursor is too old
-7. reconcile each active root against the local filesystem so changes made while the daemon was stopped are detected
-8. install recursive watches
-9. open the live WebSocket feed
+6. open the live WebSocket subscription so newly accepted events are buffered
+7. flush pending offline rescans so conflicts preserve local bytes
+8. catch up all pages from `/v1/events`, or fall back to `/v1/bootstrap` if the cursor is too old
+9. reconcile each active root against the local filesystem so changes made while the daemon was stopped are detected
+10. catch up again to include events accepted during reconciliation
+11. install recursive watches and enter `live`
 
 The daemon must not report a root as healthy live sync until both remote catch-up and startup reconciliation have completed for that root.
 
@@ -98,7 +100,7 @@ Rules:
 - use HTTPS for all request/response traffic
 - keep exactly one active authenticated session per running daemon
 - renew the bearer token before expiry
-- perform backlog catch-up over HTTP before trusting the live WebSocket stream
+- subscribe before HTTP catch-up, use WebSocket events as catch-up notifications, and do not report `live` until catch-up and reconciliation finish
 - if the socket drops, reconnect and catch up with `GET /v1/events`
 
 ## CLI Contract
