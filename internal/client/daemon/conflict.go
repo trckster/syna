@@ -19,12 +19,21 @@ import (
 	"syna/internal/common/protocol"
 )
 
-func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item scanner.Entry, conflict *PathConflictError) error {
+func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item scanner.Entry, conflict *PathConflictError) (returnErr error) {
 	stagedPath, cleanup, err := d.stageLocalFileCopy(item.AbsPath)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	localPreserved := false
+	defer func() {
+		if returnErr == nil || localPreserved {
+			return
+		}
+		if restoreErr := d.restoreStagedFileReplacingTarget(root, item, stagedPath); restoreErr != nil {
+			returnErr = fmt.Errorf("%v; restore staged local file: %w", returnErr, restoreErr)
+		}
+	}()
 	var baselineHash string
 	if entries, err := d.stateDB.EntriesForRoot(root.RootID); err != nil {
 		return err
@@ -35,7 +44,6 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 	if err != nil {
 		return err
 	}
-	removedForDirectory := false
 	if event.EventType == protocol.EventDirPut {
 		info, err := os.Lstat(item.AbsPath)
 		if err != nil {
@@ -47,12 +55,8 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		if err := os.Remove(item.AbsPath); err != nil {
 			return err
 		}
-		removedForDirectory = true
 	}
 	if err := d.applyRemoteEvent(ctx, event); err != nil {
-		if removedForDirectory {
-			_ = d.restoreStagedFile(item, stagedPath)
-		}
 		return err
 	}
 	retryOnly, matches, err := d.remoteHeadAllowsRetry(root.RootID, item)
@@ -60,14 +64,20 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		return err
 	}
 	if retryOnly {
-		return d.restoreStagedFile(item, stagedPath)
+		if err := d.restoreStagedFileReplacingTarget(root, item, stagedPath); err != nil {
+			return err
+		}
+		localPreserved = true
+		return nil
 	}
 	if matches {
+		localPreserved = true
 		return nil
 	}
 	if done, err := d.restoreNewerLocalEdit(ctx, root, item, stagedPath, baselineHash); err != nil {
 		return err
 	} else if done {
+		localPreserved = true
 		return nil
 	}
 	for attempt := 0; attempt < 5; attempt++ {
@@ -77,6 +87,7 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 			return err
 		}
 		if !syncable {
+			localPreserved = true
 			return nil
 		}
 		conflictPathID := commoncrypto.PathID(d.keys, root.RootID, conflictRelPath)
@@ -94,6 +105,7 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		}
 		resp, err := d.submitEvent(ctx, root.RootID, conflictPathID, "", protocol.EventFilePut, &baseSeq, up.Payload, up.Refs)
 		if err == nil {
+			localPreserved = true
 			return d.stateDB.UpsertEntry(state.Entry{
 				RootID:        root.RootID,
 				RelPath:       conflictRelPath,
@@ -116,6 +128,24 @@ func (d *Daemon) resolveFileConflict(ctx context.Context, root state.Root, item 
 		}
 	}
 	return fmt.Errorf("conflict copy upload retries exhausted")
+}
+
+func (d *Daemon) restoreStagedFileReplacingTarget(root state.Root, item scanner.Entry, stagedPath string) error {
+	containmentRoot := root.TargetAbsPath
+	if root.Kind == protocol.RootKindFile {
+		containmentRoot = filepath.Dir(root.TargetAbsPath)
+	}
+	if err := paths.RejectSymlinkParents(containmentRoot, item.AbsPath); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(item.AbsPath); err == nil && info.IsDir() {
+		if err := os.RemoveAll(item.AbsPath); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return d.restoreStagedFile(item, stagedPath)
 }
 
 // restoreNewerLocalEdit handles the common stale-head case: the remote head's
@@ -172,18 +202,18 @@ func (d *Daemon) restoreStagedFile(item scanner.Entry, stagedPath string) error 
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	tmp, err := os.CreateTemp(filepath.Dir(item.AbsPath), ".syna-restore-*")
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return err
 	}
