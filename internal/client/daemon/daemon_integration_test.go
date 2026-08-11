@@ -718,6 +718,48 @@ func TestIntegrationDeletedWatchedDirectoryBecomesRemovedRoot(t *testing.T) {
 	}
 }
 
+func TestIntegrationRemoveRootWithAnotherRootStillActive(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	firstDir := filepath.Join(home, "first")
+	secondDir := filepath.Join(home, "second")
+	for _, dir := range []string{firstDir, secondDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+		if err := d.AddRoot(context.Background(), dir); err != nil {
+			t.Fatalf("AddRoot(%s): %v", dir, err)
+		}
+	}
+	if err := d.RemoveRoot(context.Background(), firstDir); err != nil {
+		t.Fatalf("RemoveRoot(first): %v", err)
+	}
+
+	first, err := d.stateDB.RootByHomeRel("first")
+	if err != nil {
+		t.Fatalf("RootByHomeRel(first): %v", err)
+	}
+	if first.State != protocol.RootStateRemoved {
+		t.Fatalf("removed root state = %s want %s", first.State, protocol.RootStateRemoved)
+	}
+	second, err := d.stateDB.RootByHomeRel("second")
+	if err != nil {
+		t.Fatalf("RootByHomeRel(second): %v", err)
+	}
+	if second.State != protocol.RootStateActive {
+		t.Fatalf("retained root state = %s want %s", second.State, protocol.RootStateActive)
+	}
+}
+
 func TestIntegrationServerStoresNoPlaintextContentOrPaths(t *testing.T) {
 	h := newIntegrationHarness(t)
 	defer h.Close()

@@ -1180,16 +1180,58 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 }
 
 func (d *Daemon) consumeRemoteEvent(ctx context.Context, event protocol.EventRecord) error {
-	// Submissions are materialized locally before their server sequence can be
-	// consumed. Reapplying one later can overwrite a newer local edit made in
-	// that window; for our own events, only advance the ordered cursor.
+	// Content submissions are normally materialized locally before their server
+	// sequence can be consumed. Reapplying one later can overwrite a newer local
+	// edit made in that window. Author identity alone is not enough, though:
+	// bootstrap reconstruction and root removal can encounter our events without
+	// their effects being present locally.
 	if event.AuthorDeviceID == d.cfg.DeviceID {
-		return d.stateDB.AdvanceLastSeq(event.Seq)
+		materialized, err := d.eventMaterializedLocally(event)
+		if err != nil {
+			return err
+		}
+		if materialized {
+			return d.stateDB.AdvanceLastSeq(event.Seq)
+		}
 	}
 	if err := d.applyRemoteEvent(ctx, event); err != nil {
 		return err
 	}
 	return d.stateDB.AdvanceLastSeq(event.Seq)
+}
+
+func (d *Daemon) eventMaterializedLocally(event protocol.EventRecord) (bool, error) {
+	root, err := d.stateDB.RootByID(event.RootID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	switch event.EventType {
+	case protocol.EventRootAdd:
+		// An active root is created locally before root_add is submitted. A
+		// removed root has already progressed beyond this lifecycle event.
+		return root != nil, nil
+	case protocol.EventRootRemove:
+		return root == nil || root.State == protocol.RootStateRemoved, nil
+	}
+	if root == nil || root.State != protocol.RootStateActive {
+		return true, nil
+	}
+	if root.LatestSnapshotSeq >= event.Seq {
+		return true, nil
+	}
+	if event.PathID == nil {
+		return false, nil
+	}
+	entries, err := d.stateDB.EntriesForRoot(event.RootID)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.PathID == *event.PathID && entry.CurrentSeq >= event.Seq {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (d *Daemon) watchLoop(ctx context.Context) {

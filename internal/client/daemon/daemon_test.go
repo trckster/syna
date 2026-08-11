@@ -81,10 +81,32 @@ func TestConsumeOwnEventAdvancesCursorWithoutApplying(t *testing.T) {
 	d, cancel := newTestDaemon(t)
 	defer cancel()
 
+	root := state.Root{
+		RootID:        "root-test",
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   "test",
+		TargetAbsPath: filepath.Join(t.TempDir(), "test"),
+		State:         protocol.RootStateActive,
+	}
+	if err := d.stateDB.UpsertRoot(root); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+	pathID := "path-test"
+	if err := d.stateDB.UpsertEntry(state.Entry{
+		RootID:     root.RootID,
+		RelPath:    "file.txt",
+		PathID:     pathID,
+		Kind:       protocol.RootKindFile,
+		CurrentSeq: 12,
+	}); err != nil {
+		t.Fatalf("UpsertEntry: %v", err)
+	}
+
 	if err := d.consumeRemoteEvent(context.Background(), protocol.EventRecord{
 		Seq:            12,
-		RootID:         "unknown-root",
-		EventType:      protocol.EventRootAdd,
+		RootID:         root.RootID,
+		PathID:         &pathID,
+		EventType:      protocol.EventFilePut,
 		AuthorDeviceID: d.cfg.DeviceID,
 		PayloadBlob:    "deliberately-invalid",
 	}); err != nil {
@@ -96,6 +118,84 @@ func TestConsumeOwnEventAdvancesCursorWithoutApplying(t *testing.T) {
 	}
 	if st.LastServerSeq != 12 {
 		t.Fatalf("last server seq = %d want 12", st.LastServerSeq)
+	}
+}
+
+func TestConsumeOwnRootRemoveAppliesWhenRootStillActive(t *testing.T) {
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	root := state.Root{
+		RootID:        "root-test",
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   "test",
+		TargetAbsPath: filepath.Join(t.TempDir(), "test"),
+		State:         protocol.RootStateActive,
+	}
+	if err := d.stateDB.UpsertRoot(root); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+	if err := d.consumeRemoteEvent(context.Background(), protocol.EventRecord{
+		Seq:            13,
+		RootID:         root.RootID,
+		EventType:      protocol.EventRootRemove,
+		AuthorDeviceID: d.cfg.DeviceID,
+	}); err != nil {
+		t.Fatalf("consumeRemoteEvent own root_remove: %v", err)
+	}
+	got, err := d.stateDB.RootByID(root.RootID)
+	if err != nil {
+		t.Fatalf("RootByID: %v", err)
+	}
+	if got.State != protocol.RootStateRemoved {
+		t.Fatalf("root state = %s want %s", got.State, protocol.RootStateRemoved)
+	}
+	st, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState: %v", err)
+	}
+	if st.LastServerSeq != 13 {
+		t.Fatalf("last server seq = %d want 13", st.LastServerSeq)
+	}
+}
+
+func TestConsumeOwnPostSnapshotEventReplaysWhenMissingLocally(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+
+	keys, err := commoncrypto.Derive(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Derive: %v", err)
+	}
+	d.keys = keys
+	d.cfg.WorkspaceID = "workspace-test"
+	d.cfg.DeviceID = "device-test"
+	root := state.Root{
+		RootID:            commoncrypto.RootID(keys, "notes"),
+		Kind:              protocol.RootKindDir,
+		HomeRelPath:       "notes",
+		TargetAbsPath:     filepath.Join(home, "notes"),
+		State:             protocol.RootStateActive,
+		LatestSnapshotSeq: 5,
+	}
+	if err := os.MkdirAll(root.TargetAbsPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := d.stateDB.UpsertRoot(root); err != nil {
+		t.Fatalf("UpsertRoot: %v", err)
+	}
+	payload := protocol.DirPutPayload{Path: "post-snapshot", Mode: 0o755, MTimeNS: 1}
+	pathID := commoncrypto.PathID(keys, root.RootID, payload.Path)
+	event := mustDaemonEvent(t, keys, d.cfg.WorkspaceID, root.RootID, pathID, protocol.EventDirPut, payload)
+	event.Seq = 6
+	event.AuthorDeviceID = d.cfg.DeviceID
+	if err := d.consumeRemoteEvent(context.Background(), event); err != nil {
+		t.Fatalf("consumeRemoteEvent own post-snapshot event: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root.TargetAbsPath, payload.Path)); err != nil {
+		t.Fatalf("post-snapshot directory was not materialized: %v", err)
 	}
 }
 
