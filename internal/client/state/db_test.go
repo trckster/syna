@@ -40,6 +40,40 @@ func TestQueueRootRescanDedupes(t *testing.T) {
 	}
 }
 
+func TestQueueInitialRootRecoveryDedupesAndUpdatesIncarnation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "client.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	first := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	second := first.Add(10 * time.Second)
+	if err := db.QueueInitialRootRecovery("root-1", 11, first); err != nil {
+		t.Fatalf("QueueInitialRootRecovery(first): %v", err)
+	}
+	if err := db.QueueInitialRootRecovery("root-1", 17, second); err != nil {
+		t.Fatalf("QueueInitialRootRecovery(second): %v", err)
+	}
+
+	ops, err := db.ListPendingOps()
+	if err != nil {
+		t.Fatalf("ListPendingOps: %v", err)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 queued op, got %d", len(ops))
+	}
+	if ops[0].OpType != "recover_initial_root" || ops[0].BaseSeq != 17 {
+		t.Fatalf("unexpected recovery op: %+v", ops[0])
+	}
+	if ops[0].CreatedAt.UTC() != first {
+		t.Fatalf("expected original created_at to be preserved, got %s", ops[0].CreatedAt.UTC())
+	}
+}
+
 func TestQueueRootRemoveDedupes(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "client.db"))
 	if err != nil {

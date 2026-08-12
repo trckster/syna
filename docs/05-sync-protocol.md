@@ -14,6 +14,14 @@ The backend may reject plain HTTP in production. A development escape hatch may 
 - `Authorization: Bearer <session-token>` for authenticated endpoints
 - `X-Syna-Protocol: 1`
 
+## Server Capabilities
+
+`GET /healthz` returns a `capabilities` array. Servers that atomically bind
+initial-sync events to a root incarnation advertise
+`root_incarnation_binding`. Clients that require this safety feature must
+check the capability before submitting `root_add`, so an older server is
+rejected before workspace state is mutated.
+
 ## Session Start
 
 ### `POST /v1/session/start`
@@ -179,6 +187,7 @@ Request body:
   "path_id": "hex",
   "event_type": "file_put",
   "base_seq": 119,
+  "root_created_seq": 3,
   "payload_blob": "base64",
   "object_refs": [
     "hex"
@@ -193,6 +202,9 @@ Rules:
 - `root_add` and `root_remove` omit `path_id` and `base_seq`
 - `root_add` and `root_remove` send `object_refs: []`
 - `dir_put`, `file_put`, and `delete` require `path_id` and `base_seq`
+- initial-sync and queued initial-recovery events include `root_created_seq`;
+  the server atomically rejects them if the active root incarnation differs
+- an incarnation-bound `root_remove` also includes `root_created_seq`
 - for content events, `base_seq` must match the current `path_heads.current_seq` for that path, except for never-before-seen paths where `base_seq` must be `0`
 - `root_add` is accepted only when that `root_id` is absent or currently removed
 - if `root_add` reactivates a previously removed root, the server must clear old `path_heads` and snapshot pointers for that root so the new add behaves like a fresh first-time root

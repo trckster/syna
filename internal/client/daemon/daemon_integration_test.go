@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"syna/internal/client/scanner"
+	"syna/internal/client/state"
 	commoncfg "syna/internal/common/config"
 	"syna/internal/common/protocol"
 	"syna/internal/server/admin"
@@ -517,6 +519,782 @@ func TestIntegrationReplayOwnRootAddKeepsRootActive(t *testing.T) {
 	}
 	if root.State != protocol.RootStateActive {
 		t.Fatalf("own root_add replay changed root state to %q", root.State)
+	}
+}
+
+func TestIntegrationAddRootRecoversPeerDirectoryHeadRace(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(filepath.Join(rootDir1, "deep", "empty"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "deep", "note.txt"), []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root1): %v", err)
+	}
+	setHome(t, home1)
+	peerSubmittedDirs := false
+	err = first.AddRootWithProgress(context.Background(), rootDir1, func(progress AddProgress) {
+		if peerSubmittedDirs || progress.Stage != "syncing" || progress.Message != "synced file" {
+			return
+		}
+		peerSubmittedDirs = true
+		setHome(t, home2)
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp during add: %v", err)
+		}
+		root, err := second.stateDB.RootByHomeRel("notes")
+		if err != nil {
+			t.Fatalf("second RootByHomeRel during add: %v", err)
+		}
+		if err := second.rescanRoot(context.Background(), root.RootID); err != nil {
+			t.Fatalf("second rescanRoot during add: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("first AddRootWithProgress: %v", err)
+	}
+	if !peerSubmittedDirs {
+		t.Fatal("test did not submit peer directory heads during initial upload")
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second final bootstrapOrCatchUp: %v", err)
+	}
+
+	for _, rootDir := range []string{rootDir1, filepath.Join(home2, "notes")} {
+		got, err := os.ReadFile(filepath.Join(rootDir, "deep", "note.txt"))
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", rootDir, err)
+		}
+		if string(got) != "original\n" {
+			t.Fatalf("contents at %s = %q", rootDir, string(got))
+		}
+		if info, err := os.Stat(filepath.Join(rootDir, "deep", "empty")); err != nil || !info.IsDir() {
+			t.Fatalf("empty directory at %s: info=%v err=%v", rootDir, info, err)
+		}
+	}
+	for name, daemon := range map[string]*Daemon{"first": first, "second": second} {
+		pending, err := daemon.stateDB.CountPendingOps()
+		if err != nil {
+			t.Fatalf("%s CountPendingOps: %v", name, err)
+		}
+		if pending != 0 {
+			t.Fatalf("%s pending ops = %d want 0", name, pending)
+		}
+	}
+	bootstrap, err := first.conn.Bootstrap(context.Background())
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if len(bootstrap.Roots) != 1 {
+		t.Fatalf("bootstrap roots = %d want 1", len(bootstrap.Roots))
+	}
+	if bootstrap.Roots[0].LatestSnapshotObjectID != "" || bootstrap.Roots[0].LatestSnapshotSeq != 0 {
+		t.Fatalf("collision published a partial snapshot: %+v", bootstrap.Roots[0])
+	}
+
+	for {
+		select {
+		case <-first.changeCh:
+		default:
+			goto drained
+		}
+	}
+drained:
+	if err := os.WriteFile(filepath.Join(rootDir1, "after-add.txt"), []byte("watched\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after add): %v", err)
+	}
+	select {
+	case <-first.changeCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("successfully recovered root was not watched immediately")
+	}
+}
+
+func TestIntegrationAddRootPreservesInitialFileConflict(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "note.txt"), []byte("from-first\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(first): %v", err)
+	}
+	setHome(t, home1)
+	peerSubmittedFile := false
+	err = first.AddRootWithProgress(context.Background(), rootDir1, func(progress AddProgress) {
+		if peerSubmittedFile || progress.Stage != "syncing" || progress.Message != "uploading file" {
+			return
+		}
+		peerSubmittedFile = true
+		setHome(t, home2)
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp during add: %v", err)
+		}
+		root, err := second.stateDB.RootByHomeRel("notes")
+		if err != nil {
+			t.Fatalf("second RootByHomeRel during add: %v", err)
+		}
+		file2 := filepath.Join(home2, "notes", "note.txt")
+		if err := os.WriteFile(file2, []byte("from-second\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(second): %v", err)
+		}
+		if err := second.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+			t.Fatalf("second rescanRootHint during add: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("first AddRootWithProgress: %v", err)
+	}
+	if !peerSubmittedFile {
+		t.Fatal("test did not submit peer file during initial upload")
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second final bootstrapOrCatchUp: %v", err)
+	}
+
+	for _, rootDir := range []string{rootDir1, filepath.Join(home2, "notes")} {
+		got, err := os.ReadFile(filepath.Join(rootDir, "note.txt"))
+		if err != nil {
+			t.Fatalf("ReadFile(remote winner at %s): %v", rootDir, err)
+		}
+		if string(got) != "from-second\n" {
+			t.Fatalf("remote winner at %s = %q", rootDir, string(got))
+		}
+		matches, err := filepath.Glob(filepath.Join(rootDir, "note.syna-conflict-*"))
+		if err != nil {
+			t.Fatalf("Glob(%s): %v", rootDir, err)
+		}
+		if len(matches) != 1 {
+			t.Fatalf("conflict copies at %s = %v", rootDir, matches)
+		}
+		conflictBytes, err := os.ReadFile(matches[0])
+		if err != nil {
+			t.Fatalf("ReadFile(conflict at %s): %v", rootDir, err)
+		}
+		if string(conflictBytes) != "from-first\n" {
+			t.Fatalf("conflict contents at %s = %q", rootDir, string(conflictBytes))
+		}
+	}
+	for name, daemon := range map[string]*Daemon{"first": first, "second": second} {
+		pending, err := daemon.stateDB.CountPendingOps()
+		if err != nil {
+			t.Fatalf("%s CountPendingOps: %v", name, err)
+		}
+		if pending != 0 {
+			t.Fatalf("%s pending ops = %d want 0", name, pending)
+		}
+	}
+}
+
+func TestIntegrationAddRootSkipsSnapshotAfterInterleavedPeerEdit(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "note.txt"), []byte("initial\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(initial): %v", err)
+	}
+	setHome(t, home1)
+	peerEdited := false
+	err = first.AddRootWithProgress(context.Background(), rootDir1, func(progress AddProgress) {
+		if peerEdited || progress.Stage != "syncing" || progress.Message != "synced file" {
+			return
+		}
+		peerEdited = true
+		setHome(t, home2)
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp during add: %v", err)
+		}
+		root, err := second.stateDB.RootByHomeRel("notes")
+		if err != nil {
+			t.Fatalf("second RootByHomeRel during add: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(home2, "notes", "note.txt"), []byte("peer-newer\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(peer edit): %v", err)
+		}
+		if err := second.rescanRootHint(context.Background(), root.RootID, "note.txt"); err != nil {
+			t.Fatalf("second rescanRootHint during add: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("first AddRootWithProgress: %v", err)
+	}
+	if !peerEdited {
+		t.Fatal("test did not submit the interleaved peer edit")
+	}
+	bootstrap, err := first.conn.Bootstrap(context.Background())
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if len(bootstrap.Roots) != 1 {
+		t.Fatalf("bootstrap roots = %d want 1", len(bootstrap.Roots))
+	}
+	if bootstrap.Roots[0].LatestSnapshotObjectID != "" || bootstrap.Roots[0].LatestSnapshotSeq != 0 {
+		t.Fatalf("interleaved peer edit produced a stale snapshot: %+v", bootstrap.Roots[0])
+	}
+
+	home3 := filepath.Join(t.TempDir(), "home-three")
+	setHome(t, home3)
+	third, cancelThird := newTestDaemon(t)
+	defer cancelThird()
+	if _, err := third.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("third Connect: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(home3, "notes", "note.txt"))
+	if err != nil {
+		t.Fatalf("third ReadFile(note): %v", err)
+	}
+	if string(got) != "peer-newer\n" {
+		t.Fatalf("third note contents = %q", string(got))
+	}
+}
+
+func TestIntegrationAddRootPreservesLaterDirectoryTypeConflict(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(filepath.Join(rootDir1, "node"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "node", "child.txt"), []byte("local-child\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(child): %v", err)
+	}
+	setHome(t, home1)
+	peerReplacedDirectory := false
+	err = first.AddRootWithProgress(context.Background(), rootDir1, func(progress AddProgress) {
+		if peerReplacedDirectory || progress.Stage != "syncing" || progress.Message != "synced file" {
+			return
+		}
+		peerReplacedDirectory = true
+		setHome(t, home2)
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp during add: %v", err)
+		}
+		root, err := second.stateDB.RootByHomeRel("notes")
+		if err != nil {
+			t.Fatalf("second RootByHomeRel during add: %v", err)
+		}
+		node2 := filepath.Join(home2, "notes", "node")
+		if err := os.RemoveAll(node2); err != nil {
+			t.Fatalf("RemoveAll(peer node): %v", err)
+		}
+		if err := os.WriteFile(node2, []byte("peer-file\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(peer node): %v", err)
+		}
+		if err := second.rescanRoot(context.Background(), root.RootID); err != nil {
+			t.Fatalf("second rescanRoot during add: %v", err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("first AddRootWithProgress: %v", err)
+	}
+	if !peerReplacedDirectory {
+		t.Fatal("test did not replace the initial directory from the peer")
+	}
+	if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+		t.Fatalf("second final bootstrapOrCatchUp: %v", err)
+	}
+
+	for _, rootDir := range []string{rootDir1, filepath.Join(home2, "notes")} {
+		got, err := os.ReadFile(filepath.Join(rootDir, "node"))
+		if err != nil {
+			t.Fatalf("ReadFile(peer node at %s): %v", rootDir, err)
+		}
+		if string(got) != "peer-file\n" {
+			t.Fatalf("peer node at %s = %q", rootDir, string(got))
+		}
+		matches, err := filepath.Glob(filepath.Join(rootDir, "node.syna-conflict-*"))
+		if err != nil {
+			t.Fatalf("Glob(%s): %v", rootDir, err)
+		}
+		if len(matches) != 1 {
+			t.Fatalf("directory conflict copies at %s = %v", rootDir, matches)
+		}
+		child, err := os.ReadFile(filepath.Join(matches[0], "child.txt"))
+		if err != nil {
+			t.Fatalf("ReadFile(preserved child at %s): %v", rootDir, err)
+		}
+		if string(child) != "local-child\n" {
+			t.Fatalf("preserved child at %s = %q", rootDir, string(child))
+		}
+	}
+}
+
+func TestIntegrationAddRootQueuesRecoveryAfterInitialTransportFailure(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	eventSubmits := 0
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/events" {
+			eventSubmits++
+			if eventSubmits == 2 {
+				return nil, errors.New("initial upload transport failed")
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	err := d.AddRoot(context.Background(), rootDir)
+	if err == nil || !strings.Contains(err.Error(), "initial root upload") {
+		t.Fatalf("AddRoot error = %v, want actionable initial-upload error", err)
+	}
+	root, err := d.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	if root.State != protocol.RootStateActive {
+		t.Fatalf("root state = %s want %s", root.State, protocol.RootStateActive)
+	}
+	pending, err := d.stateDB.CountPendingOps()
+	if err != nil {
+		t.Fatalf("CountPendingOps: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending ops = %d want 1", pending)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "after-failure.txt"), []byte("watched\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after failure): %v", err)
+	}
+	select {
+	case <-d.changeCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active root had queued recovery but no watcher after transport failure")
+	}
+}
+
+func TestIntegrationAddRootQueuesRecoveryAfterLostRootAddResponse(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	resp, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	dropped := false
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		response, err := http.DefaultTransport.RoundTrip(req)
+		if err == nil && !dropped && req.Method == http.MethodPost && req.URL.Path == "/v1/events" {
+			dropped = true
+			_ = response.Body.Close()
+			return nil, errors.New("root_add response lost")
+		}
+		return response, err
+	})
+
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root): %v", err)
+	}
+	err = d.AddRoot(context.Background(), rootDir)
+	if err == nil || !strings.Contains(err.Error(), "root_add response lost") {
+		t.Fatalf("AddRoot error = %v, want lost-response error", err)
+	}
+	if !dropped {
+		t.Fatal("test did not drop the committed root_add response")
+	}
+	ops, err := d.stateDB.ListPendingOps()
+	if err != nil {
+		t.Fatalf("ListPendingOps: %v", err)
+	}
+	if len(ops) != 1 || ops[0].OpType != "recover_initial_root" || ops[0].BaseSeq != 0 {
+		t.Fatalf("pending ops = %+v, want unknown-incarnation initial recovery", ops)
+	}
+	if err := d.flushPendingOps(context.Background()); err != nil {
+		t.Fatalf("flushPendingOps: %v", err)
+	}
+	pending, err := d.stateDB.CountPendingOps()
+	if err != nil {
+		t.Fatalf("CountPendingOps: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending ops after recovery = %d want 0", pending)
+	}
+
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: resp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(home2, "notes", "note.txt"))
+	if err != nil {
+		t.Fatalf("second ReadFile(note): %v", err)
+	}
+	if string(got) != "local\n" {
+		t.Fatalf("second note contents = %q", string(got))
+	}
+}
+
+func TestIntegrationAddRootRejectsServerWithoutIncarnationCapabilityBeforeMutation(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/healthz" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Request:    req,
+			}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	err := d.AddRoot(context.Background(), rootDir)
+	if err == nil || !strings.Contains(err.Error(), "server upgrade required") {
+		t.Fatalf("AddRoot error = %v, want preflight upgrade error", err)
+	}
+	current, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq: %v", err)
+	}
+	if current != 0 {
+		t.Fatalf("server sequence = %d want 0 after capability rejection", current)
+	}
+	roots, err := d.stateDB.ListRoots()
+	if err != nil {
+		t.Fatalf("ListRoots: %v", err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("local roots = %+v, want none after capability rejection", roots)
+	}
+}
+
+func TestIntegrationAddRootReportsPostConflictReconcileFailure(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(filepath.Join(rootDir1, "deep"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "deep", "note.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root1): %v", err)
+	}
+	setHome(t, home1)
+	peerSubmittedDirs := false
+	postHookEventSubmits := 0
+	err = first.AddRootWithProgress(context.Background(), rootDir1, func(progress AddProgress) {
+		if peerSubmittedDirs || progress.Stage != "syncing" || progress.Message != "synced file" {
+			return
+		}
+		peerSubmittedDirs = true
+		setHome(t, home2)
+		if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+			t.Fatalf("second bootstrapOrCatchUp during add: %v", err)
+		}
+		root, err := second.stateDB.RootByHomeRel("notes")
+		if err != nil {
+			t.Fatalf("second RootByHomeRel during add: %v", err)
+		}
+		if err := second.rescanRoot(context.Background(), root.RootID); err != nil {
+			t.Fatalf("second rescanRoot during add: %v", err)
+		}
+		first.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodPost && req.URL.Path == "/v1/events" {
+				postHookEventSubmits++
+				if postHookEventSubmits == 2 {
+					return nil, errors.New("post-conflict reconcile transport failed")
+				}
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "reconcile initial path conflict") {
+		t.Fatalf("first AddRootWithProgress error = %v, want reconciliation error", err)
+	}
+	if postHookEventSubmits < 2 {
+		t.Fatalf("post-hook event submits = %d want at least 2", postHookEventSubmits)
+	}
+	pending, err := first.stateDB.CountPendingOps()
+	if err != nil {
+		t.Fatalf("CountPendingOps: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending ops = %d want 1", pending)
+	}
+	first.conn.HTTPClient.Transport = http.DefaultTransport
+	if err := first.flushPendingOps(context.Background()); err != nil {
+		t.Fatalf("flushPendingOps: %v", err)
+	}
+	pending, err = first.stateDB.CountPendingOps()
+	if err != nil {
+		t.Fatalf("CountPendingOps(after): %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending ops after recovery = %d want 0", pending)
+	}
+}
+
+func TestIntegrationInitialUploadDoesNotCrossReplacementIncarnation(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home1 := filepath.Join(t.TempDir(), "home-one")
+	setHome(t, home1)
+	first, cancelFirst := newTestDaemon(t)
+	defer cancelFirst()
+	firstResp, err := first.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL})
+	if err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	home2 := filepath.Join(t.TempDir(), "home-two")
+	setHome(t, home2)
+	second, cancelSecond := newTestDaemon(t)
+	defer cancelSecond()
+	if _, err := second.Connect(context.Background(), ConnectRequest{
+		ServerURL:   h.serverURL,
+		RecoveryKey: firstResp.GeneratedRecoveryKey,
+	}); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	rootDir1 := filepath.Join(home1, "notes")
+	if err := os.MkdirAll(rootDir1, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir1, "old-only.txt"), []byte("old incarnation\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(old-only): %v", err)
+	}
+	setHome(t, home1)
+	eventSubmits := 0
+	replaced := false
+	var replacementHead int64
+	first.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/events" {
+			eventSubmits++
+			if eventSubmits == 2 {
+				setHome(t, home2)
+				if err := second.bootstrapOrCatchUp(context.Background()); err != nil {
+					t.Fatalf("second bootstrapOrCatchUp: %v", err)
+				}
+				rootDir2 := filepath.Join(home2, "notes")
+				if err := second.RemoveRoot(context.Background(), rootDir2); err != nil {
+					t.Fatalf("second RemoveRoot: %v", err)
+				}
+				if err := os.RemoveAll(rootDir2); err != nil {
+					t.Fatalf("RemoveAll(second old incarnation): %v", err)
+				}
+				if err := os.MkdirAll(rootDir2, 0o755); err != nil {
+					t.Fatalf("MkdirAll(second replacement): %v", err)
+				}
+				if err := second.AddRoot(context.Background(), rootDir2); err != nil {
+					t.Fatalf("second replacement AddRoot: %v", err)
+				}
+				replaced = true
+				replacementHead, err = h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+				if err != nil {
+					t.Fatalf("CurrentSeq(replacement): %v", err)
+				}
+				return http.DefaultTransport.RoundTrip(req)
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	err = first.AddRoot(context.Background(), rootDir1)
+	if err == nil || !strings.Contains(err.Error(), "root_incarnation_mismatch") {
+		t.Fatalf("first AddRoot error = %v, want incarnation-mismatch error", err)
+	}
+	if !replaced {
+		t.Fatal("test did not replace the root incarnation")
+	}
+	root, err := first.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("first RootByHomeRel: %v", err)
+	}
+	if !first.isRootStaged(root.RootID) {
+		t.Fatal("failed initial add was not staged after remote replacement")
+	}
+	ops, err := first.stateDB.ListPendingOps()
+	if err != nil {
+		t.Fatalf("ListPendingOps: %v", err)
+	}
+	if len(ops) != 1 || ops[0].OpType != "recover_initial_root" || ops[0].BaseSeq == 0 {
+		t.Fatalf("pending ops = %+v, want incarnation-bound recovery", ops)
+	}
+	beforeFlush, err := h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(before): %v", err)
+	}
+	if beforeFlush != replacementHead {
+		t.Fatalf("replacement head advanced from %d to %d after rejected initial event", replacementHead, beforeFlush)
+	}
+	if err := os.RemoveAll(rootDir1); err != nil {
+		t.Fatalf("RemoveAll(first missing root): %v", err)
+	}
+	err = first.rescanRootHintWithRetry(context.Background(), root.RootID, "", true, false, true, ops[0].BaseSeq)
+	var incarnationConflict *RootIncarnationConflictError
+	if !errors.As(err, &incarnationConflict) {
+		t.Fatalf("forced missing-root rescan error = %v, want incarnation conflict", err)
+	}
+	afterRejectedRemove, err := h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(after rejected remove): %v", err)
+	}
+	if afterRejectedRemove != beforeFlush {
+		t.Fatalf("replacement head advanced from %d to %d after rejected old root_remove", beforeFlush, afterRejectedRemove)
+	}
+	if err := first.flushPendingOps(context.Background()); err != nil {
+		t.Fatalf("flushPendingOps: %v", err)
+	}
+	afterFlush, err := h.serverDB.CurrentSeq(first.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(after): %v", err)
+	}
+	if afterFlush != beforeFlush {
+		t.Fatalf("replacement head advanced from %d to %d while flushing old recovery", beforeFlush, afterFlush)
+	}
+	pending, err := first.stateDB.CountPendingOps()
+	if err != nil {
+		t.Fatalf("CountPendingOps: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("pending ops after rejecting old recovery = %d want 0", pending)
 	}
 }
 
@@ -1446,6 +2224,72 @@ func TestIntegrationConcurrentEditConflictCopy(t *testing.T) {
 	}
 	if !foundConflict {
 		t.Fatalf("expected conflict entry in second client state")
+	}
+}
+
+func TestIntegrationFileConflictRetainsStageWhenRestorationFails(t *testing.T) {
+	h := newIntegrationHarness(t)
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancel := newTestDaemon(t)
+	defer cancel()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	filePath := filepath.Join(rootDir, "note.txt")
+	if err := os.WriteFile(filePath, []byte("only local copy\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(note): %v", err)
+	}
+	locked := false
+	d.conn.HTTPClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if !locked && req.Method == http.MethodGet && req.URL.Path == "/v1/events" {
+			locked = true
+			if err := os.Chmod(rootDir, 0); err != nil {
+				t.Fatalf("Chmod(lock root): %v", err)
+			}
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	item := scanner.Entry{
+		RelPath:       "note.txt",
+		AbsPath:       filePath,
+		Kind:          protocol.RootKindFile,
+		Mode:          0o644,
+		MTimeNS:       time.Now().UnixNano(),
+		ContentSHA256: "local",
+	}
+	err := d.resolveFileConflict(context.Background(), state.Root{
+		RootID:        "root-1",
+		Kind:          protocol.RootKindDir,
+		HomeRelPath:   "notes",
+		TargetAbsPath: rootDir,
+		State:         protocol.RootStateActive,
+	}, item, &PathConflictError{CurrentSeq: 999})
+	if chmodErr := os.Chmod(rootDir, 0o755); chmodErr != nil {
+		t.Fatalf("Chmod(unlock root): %v", chmodErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "restore staged local file") {
+		t.Fatalf("resolveFileConflict error = %v, want restoration failure", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(d.paths.StateDir, "syna-conflict-*"))
+	if err != nil {
+		t.Fatalf("Glob(staged files): %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("retained staged files = %v, want one", matches)
+	}
+	got, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("ReadFile(retained stage): %v", err)
+	}
+	if string(got) != "only local copy\n" {
+		t.Fatalf("retained stage contents = %q", string(got))
 	}
 }
 

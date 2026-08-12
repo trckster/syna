@@ -386,6 +386,75 @@ func TestSaveSnapshotRejectsPreviousRootIncarnation(t *testing.T) {
 	}
 }
 
+func TestSubmitEventRejectsPreviousRootIncarnation(t *testing.T) {
+	database := openTestDB(t)
+	sess := testSession()
+
+	if _, err := database.EnsureWorkspace(sess.WorkspaceID, []byte("public-key")); err != nil {
+		t.Fatalf("EnsureWorkspace: %v", err)
+	}
+	oldRoot, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-old",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(root_add old): %v", err)
+	}
+	if _, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		EventType:   protocol.EventRootRemove,
+		PayloadBlob: "remove",
+	}); err != nil {
+		t.Fatalf("SubmitEvent(root_remove): %v", err)
+	}
+	newRoot, err := database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:      "root-1",
+		RootKind:    protocol.RootKindDir,
+		EventType:   protocol.EventRootAdd,
+		PayloadBlob: "descriptor-new",
+	})
+	if err != nil {
+		t.Fatalf("SubmitEvent(root_add new): %v", err)
+	}
+	before, err := database.CurrentSeq(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(before): %v", err)
+	}
+	_, err = database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:         "root-1",
+		PathID:         "old-only-path",
+		EventType:      protocol.EventFilePut,
+		BaseSeq:        ptrInt64(0),
+		RootCreatedSeq: &oldRoot.AcceptedSeq,
+		PayloadBlob:    "file-put-old",
+	})
+	var mismatch *RootIncarnationMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("SubmitEvent error = %v, want RootIncarnationMismatchError", err)
+	}
+	if mismatch.CurrentSeq != newRoot.AcceptedSeq {
+		t.Fatalf("current incarnation = %d want %d", mismatch.CurrentSeq, newRoot.AcceptedSeq)
+	}
+	_, err = database.SubmitEvent(sess, protocol.EventSubmitRequest{
+		RootID:         "root-1",
+		EventType:      protocol.EventRootRemove,
+		RootCreatedSeq: &oldRoot.AcceptedSeq,
+		PayloadBlob:    "remove-new-with-old-incarnation",
+	})
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("SubmitEvent(root_remove) error = %v, want RootIncarnationMismatchError", err)
+	}
+	after, err := database.CurrentSeq(sess.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(after): %v", err)
+	}
+	if after != before {
+		t.Fatalf("workspace head advanced from %d to %d after rejected old-incarnation event", before, after)
+	}
+}
+
 func TestSaveSnapshotRejectsFutureBaseSeq(t *testing.T) {
 	database := openTestDB(t)
 	sess := testSession()

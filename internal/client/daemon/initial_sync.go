@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"syna/internal/client/scanner"
@@ -16,9 +17,15 @@ type initialRootSync struct {
 	Entries    []state.Entry
 	Snapshot   protocol.SnapshotPayload
 	ObjectRefs []string
+	Conflict   *initialRootConflict
 }
 
-func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPath string, scan *scanner.Result, progress AddProgressFunc, progressState *addProgressState) (*initialRootSync, error) {
+type initialRootConflict struct {
+	Item scanner.Entry
+	Err  *PathConflictError
+}
+
+func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPath string, rootCreatedSeq int64, scan *scanner.Result, progress AddProgressFunc, progressState *addProgressState) (*initialRootSync, error) {
 	sync := &initialRootSync{
 		Snapshot: protocol.SnapshotPayload{
 			RootID:      rootID,
@@ -29,8 +36,12 @@ func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPa
 	for _, item := range syncOrder(scan.Entries) {
 		pathID := commoncrypto.PathID(d.keys, rootID, item.RelPath)
 		if item.Kind == protocol.RootKindDir {
-			if err := d.submitInitialDir(ctx, sync, rootID, pathID, item); err != nil {
-				return nil, err
+			if err := d.submitInitialDir(ctx, sync, rootID, pathID, rootCreatedSeq, item); err != nil {
+				var conflict *PathConflictError
+				if errors.As(err, &conflict) {
+					sync.Conflict = &initialRootConflict{Item: item, Err: conflict}
+				}
+				return sync, err
 			}
 			progressState.DoneEntries++
 			reportAddProgress(progress, AddProgress{
@@ -47,16 +58,20 @@ func (d *Daemon) submitInitialRootEntries(ctx context.Context, rootID, homeRelPa
 			continue
 		}
 		if item.Kind == protocol.RootKindFile {
-			if err := d.submitInitialFile(ctx, sync, rootID, pathID, item, homeRelPath, progress, progressState); err != nil {
-				return nil, err
+			if err := d.submitInitialFile(ctx, sync, rootID, pathID, rootCreatedSeq, item, homeRelPath, progress, progressState); err != nil {
+				var conflict *PathConflictError
+				if errors.As(err, &conflict) {
+					sync.Conflict = &initialRootConflict{Item: item, Err: conflict}
+				}
+				return sync, err
 			}
 		}
 	}
 	return sync, nil
 }
 
-func (d *Daemon) submitInitialDir(ctx context.Context, sync *initialRootSync, rootID, pathID string, item scanner.Entry) error {
-	resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventDirPut, ptrInt64(0), protocol.DirPutPayload{
+func (d *Daemon) submitInitialDir(ctx context.Context, sync *initialRootSync, rootID, pathID string, rootCreatedSeq int64, item scanner.Entry) error {
+	resp, err := d.submitEventForIncarnation(ctx, rootID, pathID, "", protocol.EventDirPut, ptrInt64(0), rootCreatedSeq, protocol.DirPutPayload{
 		Path:    item.RelPath,
 		Mode:    item.Mode,
 		MTimeNS: item.MTimeNS,
@@ -82,7 +97,7 @@ func (d *Daemon) submitInitialDir(ctx context.Context, sync *initialRootSync, ro
 	return nil
 }
 
-func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, rootID, pathID string, item scanner.Entry, homeRelPath string, progress AddProgressFunc, progressState *addProgressState) error {
+func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, rootID, pathID string, rootCreatedSeq int64, item scanner.Entry, homeRelPath string, progress AddProgressFunc, progressState *addProgressState) error {
 	progressPath := displaySyncPath(homeRelPath, item.RelPath)
 	up, err := uploader.UploadFileWithProgress(ctx, d.conn, d.keys.BlobKey, d.cfg.WorkspaceID, rootID, pathID, item.RelPath, item.AbsPath, item.Mode, item.MTimeNS, func(upload uploader.Progress) {
 		progressState.DoneBytes += upload.PlainBytes
@@ -101,7 +116,7 @@ func (d *Daemon) submitInitialFile(ctx context.Context, sync *initialRootSync, r
 	if err != nil {
 		return err
 	}
-	resp, err := d.submitEvent(ctx, rootID, pathID, "", protocol.EventFilePut, ptrInt64(0), up.Payload, up.Refs)
+	resp, err := d.submitEventForIncarnation(ctx, rootID, pathID, "", protocol.EventFilePut, ptrInt64(0), rootCreatedSeq, up.Payload, up.Refs)
 	if err != nil {
 		return err
 	}
