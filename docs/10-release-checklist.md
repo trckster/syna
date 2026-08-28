@@ -2,7 +2,7 @@
 
 Run this checklist before publishing a server or client build.
 
-1. Build and test with Go `1.26.5` or a newer fixed `1.26.x` patch release.
+1. Build and test with Go `1.26.6` or a newer fixed `1.26.x` patch release.
 2. Run `go test ./...`.
 3. Run `go vet ./...`.
 4. Run `govulncheck ./...` and block the release on any reachable vulnerability.
