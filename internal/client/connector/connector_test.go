@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -73,6 +74,73 @@ func TestResponseErrorPreservesOperationForEmptyBody(t *testing.T) {
 	})
 	if err.Error() != "open websocket: http 401" {
 		t.Fatalf("error = %q", err.Error())
+	}
+}
+
+func TestAuthenticatedHTTP401NotifiesSessionOwner(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Client) error
+	}{
+		{name: "json", run: func(client *Client) error {
+			_, err := client.Bootstrap(context.Background())
+			return err
+		}},
+		{name: "upload", run: func(client *Client) error {
+			return client.UploadObject(context.Background(), "object-1", "file_chunk", 1, []byte("x"))
+		}},
+		{name: "download", run: func(client *Client) error {
+			_, err := client.DownloadObject(context.Background(), "object-1", 16)
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var rejectedToken string
+			client := (&Client{
+				BaseURL: "https://example.test",
+				Token:   "expired-token",
+				HTTPClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Body:       io.NopCloser(strings.NewReader(`{"code":"unauthorized"}`)),
+						Header:     make(http.Header),
+						Request:    req,
+					}, nil
+				})},
+			}).WithUnauthorizedHandler(func(token string) {
+				rejectedToken = token
+			})
+
+			if err := tc.run(client); !IsHTTPError(err, http.StatusUnauthorized, "unauthorized") {
+				t.Fatalf("error = %#v, expected typed unauthorized response", err)
+			}
+			if rejectedToken != "expired-token" {
+				t.Fatalf("rejected token = %q want expired-token", rejectedToken)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedWebSocket401NotifiesSessionOwner(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	var rejectedToken string
+	client := New(server.URL).
+		WithToken("expired-token").
+		WithUnauthorizedHandler(func(token string) {
+			rejectedToken = token
+		})
+	if _, err := client.DialWS(context.Background()); !IsHTTPError(err, http.StatusUnauthorized, "unauthorized") {
+		t.Fatalf("DialWS error = %#v, expected typed unauthorized response", err)
+	}
+	if rejectedToken != "expired-token" {
+		t.Fatalf("rejected token = %q want expired-token", rejectedToken)
 	}
 }
 

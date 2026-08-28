@@ -37,6 +37,26 @@ func TestMergeRescanHints(t *testing.T) {
 	}
 }
 
+func TestSessionRenewalDelayLeavesExpiryMargin(t *testing.T) {
+	now := time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		expiresAt time.Time
+		want      time.Duration
+	}{
+		{name: "long session", expiresAt: now.Add(time.Hour), want: 55 * time.Minute},
+		{name: "short session", expiresAt: now.Add(100 * time.Second), want: 90 * time.Second},
+		{name: "expired session", expiresAt: now.Add(-time.Second), want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionRenewalDelay(now, tc.expiresAt); got != tc.want {
+				t.Fatalf("sessionRenewalDelay = %s want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHandlePurgedWorkspaceClearsSyncStateButRetainsKey(t *testing.T) {
 	d, cancel := newTestDaemon(t)
 	defer cancel()

@@ -18,6 +18,7 @@ type sessionHandshake struct {
 	DeviceName      string
 	Keys            *commoncrypto.DerivedKeys
 	CreateIfMissing bool
+	OnUnauthorized  func(string)
 }
 
 type authenticatedSession struct {
@@ -36,7 +37,7 @@ func authenticateSession(ctx context.Context, req sessionHandshake) (*authentica
 	if err != nil {
 		return nil, err
 	}
-	client := connector.New(req.ServerURL)
+	client := connector.New(req.ServerURL).WithUnauthorizedHandler(req.OnUnauthorized)
 	startResp, err := client.SessionStart(ctx, protocol.SessionStartRequest{
 		WorkspaceID:     req.WorkspaceID,
 		DeviceID:        req.DeviceID,

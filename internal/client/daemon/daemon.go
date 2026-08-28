@@ -34,21 +34,22 @@ import (
 )
 
 type Daemon struct {
-	paths    commoncfg.ClientPaths
-	configs  *configstore.Store
-	stateDB  *state.DB
-	cfg      configstore.Config
-	keyring  configstore.Keyring
-	keys     *commoncrypto.DerivedKeys
-	conn     *connector.Client
-	logger   *log.Logger
-	watcher  *watcher.Manager
-	changeCh chan watcher.Change
-	mu       sync.Mutex
-	syncMu   sync.Mutex
-	stageMu  sync.RWMutex
-	shutdown context.CancelFunc
-	runCtx   context.Context
+	paths           commoncfg.ClientPaths
+	configs         *configstore.Store
+	stateDB         *state.DB
+	cfg             configstore.Config
+	keyring         configstore.Keyring
+	keys            *commoncrypto.DerivedKeys
+	conn            *connector.Client
+	logger          *log.Logger
+	watcher         *watcher.Manager
+	changeCh        chan watcher.Change
+	sessionRejected chan string
+	mu              sync.Mutex
+	syncMu          sync.Mutex
+	stageMu         sync.RWMutex
+	shutdown        context.CancelFunc
+	runCtx          context.Context
 
 	reconnectCancel       context.CancelFunc
 	intentionalDisconnect bool
@@ -166,14 +167,15 @@ func New(paths commoncfg.ClientPaths, logger *log.Logger) (*Daemon, error) {
 		}
 	}
 	d := &Daemon{
-		paths:       paths,
-		configs:     configs,
-		stateDB:     stateDB,
-		cfg:         cfg,
-		keyring:     keyring,
-		logger:      logger,
-		changeCh:    make(chan watcher.Change, 128),
-		stagedRoots: make(map[string]struct{}),
+		paths:           paths,
+		configs:         configs,
+		stateDB:         stateDB,
+		cfg:             cfg,
+		keyring:         keyring,
+		logger:          logger,
+		changeCh:        make(chan watcher.Change, 128),
+		sessionRejected: make(chan string, 8),
+		stagedRoots:     make(map[string]struct{}),
 	}
 	d.watcher, err = watcher.New(func(change watcher.Change) {
 		select {
@@ -194,7 +196,7 @@ func New(paths commoncfg.ClientPaths, logger *log.Logger) (*Daemon, error) {
 		if err := validateServerURL(cfg.ServerURL); err != nil {
 			logger.Printf("configured server URL rejected: %v", err)
 		} else {
-			d.conn = connector.New(cfg.ServerURL)
+			d.conn = connector.New(cfg.ServerURL).WithUnauthorizedHandler(d.notifySessionRejected)
 			if workspaceState.SessionToken != "" {
 				d.conn = d.conn.WithToken(workspaceState.SessionToken)
 			}
@@ -313,6 +315,7 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 		DeviceName:      d.cfg.DeviceName,
 		Keys:            keys,
 		CreateIfMissing: createIfMissing,
+		OnUnauthorized:  d.notifySessionRejected,
 	})
 	if err != nil {
 		return nil, err
@@ -1160,6 +1163,13 @@ func (d *Daemon) reconnectLoop(ctx context.Context) {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
+			if errors.Is(err, errSessionRenewal) {
+				if clearErr := d.stateDB.ClearSession(); clearErr != nil {
+					err = fmt.Errorf("clear session for renewal: %w", clearErr)
+				} else {
+					continue
+				}
+			}
 			discarded, discardErr := d.discardRejectedCachedSession(err)
 			if discardErr != nil {
 				err = fmt.Errorf("clear rejected session: %w", discardErr)
@@ -1292,6 +1302,12 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 	if err := d.ensureSession(ctx); err != nil {
 		return markLifecycle(protocol.IssueAuth, err)
 	}
+	sessionState, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		return err
+	}
+	renewTimer := time.NewTimer(sessionRenewalDelay(time.Now().UTC(), sessionState.SessionExpiresAt))
+	defer renewTimer.Stop()
 	d.mu.Lock()
 	conn = d.conn
 	d.mu.Unlock()
@@ -1344,10 +1360,12 @@ func (d *Daemon) syncAndStream(ctx context.Context) error {
 
 	d.setStreamingLive(true)
 	defer d.setStreamingLive(false)
-	return d.consumeWebsocketStream(ctx, stream)
+	return d.consumeWebsocketStream(ctx, stream, conn.Token, renewTimer.C)
 }
 
 var (
+	errSessionRenewal = errors.New("session renewal due")
+
 	wsClientPongWait  = 75 * time.Second
 	wsClientPingEvery = 25 * time.Second
 	wsClientWriteWait = 10 * time.Second
@@ -1431,14 +1449,21 @@ func (s *websocketStream) Err() error {
 func (d *Daemon) streamEvents(ctx context.Context, ws *websocket.Conn) error {
 	stream := startWebsocketStream(ctx, ws)
 	defer stream.Close()
-	return d.consumeWebsocketStream(ctx, stream)
+	return d.consumeWebsocketStream(ctx, stream, "", nil)
 }
 
-func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketStream) error {
+func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketStream, token string, renew <-chan time.Time) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-renew:
+			return errSessionRenewal
+		case rejectedToken := <-d.sessionRejected:
+			if token == "" || rejectedToken != token {
+				continue
+			}
+			return &connector.HTTPError{StatusCode: http.StatusUnauthorized, Code: "unauthorized"}
 		case err := <-stream.errors:
 			return err
 		case <-stream.notify:
@@ -2174,7 +2199,10 @@ func (d *Daemon) ensureSession(ctx context.Context) error {
 		return err
 	}
 	if st.SessionToken != "" && !st.SessionExpiresAt.IsZero() && time.Now().UTC().Before(st.SessionExpiresAt.Add(-5*time.Minute)) {
-		d.conn = connector.New(d.cfg.ServerURL).WithToken(st.SessionToken)
+		d.conn = connector.New(d.cfg.ServerURL).
+			WithUnauthorizedHandler(d.notifySessionRejected).
+			WithToken(st.SessionToken)
+		d.discardSessionRejections()
 		return nil
 	}
 	session, err := authenticateSession(ctx, sessionHandshake{
@@ -2184,11 +2212,13 @@ func (d *Daemon) ensureSession(ctx context.Context) error {
 		DeviceName:      d.cfg.DeviceName,
 		Keys:            d.keys,
 		CreateIfMissing: false,
+		OnUnauthorized:  d.notifySessionRejected,
 	})
 	if err != nil {
 		return err
 	}
 	d.conn = session.Client
+	d.discardSessionRejections()
 	return d.stateDB.SaveWorkspaceState(state.WorkspaceState{
 		ServerURL:        d.cfg.ServerURL,
 		WorkspaceID:      d.cfg.WorkspaceID,
@@ -2198,6 +2228,38 @@ func (d *Daemon) ensureSession(ctx context.Context) error {
 		ConnectionState:  protocol.ConnectionAuthenticating,
 		LastError:        "",
 	})
+}
+
+func (d *Daemon) notifySessionRejected(token string) {
+	select {
+	case d.sessionRejected <- token:
+	default:
+	}
+}
+
+func (d *Daemon) discardSessionRejections() {
+	for {
+		select {
+		case <-d.sessionRejected:
+		default:
+			return
+		}
+	}
+}
+
+func sessionRenewalDelay(now, expiresAt time.Time) time.Duration {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	lead := 5 * time.Minute
+	if lead >= remaining {
+		lead = remaining / 10
+	}
+	if lead <= 0 {
+		lead = time.Nanosecond
+	}
+	return remaining - lead
 }
 
 func (d *Daemon) startReconnectLoopLocked() {

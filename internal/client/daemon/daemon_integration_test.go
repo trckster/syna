@@ -53,6 +53,10 @@ func newIntegrationHarnessWithMaxEventFetchPage(t *testing.T, maxEventFetchPage 
 }
 
 func newIntegrationHarnessWithObserver(t *testing.T, maxEventFetchPage int, observe func(string)) *integrationHarness {
+	return newIntegrationHarnessWithSessionTTLAndObserver(t, maxEventFetchPage, time.Hour, observe)
+}
+
+func newIntegrationHarnessWithSessionTTLAndObserver(t *testing.T, maxEventFetchPage int, sessionTTL time.Duration, observe func(string)) *integrationHarness {
 	t.Helper()
 
 	dataDir := filepath.Join(t.TempDir(), "server")
@@ -68,7 +72,7 @@ func newIntegrationHarnessWithObserver(t *testing.T, maxEventFetchPage int, obse
 	}
 	cfg := servercfg.Config{
 		DataDir:           dataDir,
-		SessionTTL:        time.Hour,
+		SessionTTL:        sessionTTL,
 		EventRetention:    24 * time.Hour,
 		ZeroRefRetention:  24 * time.Hour,
 		AllowHTTP:         true,
@@ -1887,6 +1891,226 @@ func TestIntegrationSubscribesBeforeCatchUpAndLive(t *testing.T) {
 	if got[0] != "/v1/ws" {
 		t.Fatalf("first live-sync request = %q want /v1/ws; requests=%v", got[0], got)
 	}
+}
+
+func TestIntegrationRenewsLiveSessionBeforeExpiry(t *testing.T) {
+	var (
+		requestMu       sync.Mutex
+		sessionFinishes int
+		websockets      int
+	)
+	h := newIntegrationHarnessWithSessionTTLAndObserver(t, 1000, 3*time.Second, func(path string) {
+		requestMu.Lock()
+		defer requestMu.Unlock()
+		switch path {
+		case "/v1/session/finish":
+			sessionFinishes++
+		case "/v1/ws":
+			websockets++
+		}
+	})
+	defer h.Close()
+
+	d, cancelDaemon := newTestDaemon(t)
+	defer cancelDaemon()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.reconnectLoop(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("reconnect loop did not stop")
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var firstLiveSession state.WorkspaceState
+	for time.Now().Before(deadline) {
+		status, err := d.Status()
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		requestMu.Lock()
+		finishes := sessionFinishes
+		wsCount := websockets
+		requestMu.Unlock()
+		if status.Connection == protocol.ConnectionLive && finishes >= 2 && wsCount >= 1 {
+			firstLiveSession, err = d.stateDB.LoadWorkspaceState()
+			if err != nil {
+				t.Fatalf("LoadWorkspaceState: %v", err)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if firstLiveSession.SessionToken == "" {
+		t.Fatal("client did not establish the initial short-lived live session")
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, err := d.stateDB.LoadWorkspaceState()
+		if err != nil {
+			t.Fatalf("LoadWorkspaceState(after renewal): %v", err)
+		}
+		status, err := d.Status()
+		if err != nil {
+			t.Fatalf("Status(after renewal): %v", err)
+		}
+		requestMu.Lock()
+		finishes := sessionFinishes
+		wsCount := websockets
+		requestMu.Unlock()
+		if current.SessionToken != "" && current.SessionToken != firstLiveSession.SessionToken && status.Connection == protocol.ConnectionLive && finishes >= 3 && wsCount >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("live session was not renewed and resubscribed; first expiry=%s", firstLiveSession.SessionExpiresAt)
+}
+
+func TestIntegrationHTTP401ReconnectsAndFlushesQueuedChange(t *testing.T) {
+	var (
+		requestMu  sync.Mutex
+		websockets int
+	)
+	h := newIntegrationHarnessWithObserver(t, 1000, func(path string) {
+		if path != "/v1/ws" {
+			return
+		}
+		requestMu.Lock()
+		websockets++
+		requestMu.Unlock()
+	})
+	defer h.Close()
+
+	home := filepath.Join(t.TempDir(), "home")
+	setHome(t, home)
+	d, cancelDaemon := newTestDaemon(t)
+	defer cancelDaemon()
+	if _, err := d.Connect(context.Background(), ConnectRequest{ServerURL: h.serverURL}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	rootDir := filepath.Join(home, "notes")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(root): %v", err)
+	}
+	file := filepath.Join(rootDir, "note.txt")
+	if err := os.WriteFile(file, []byte("before\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(before): %v", err)
+	}
+	if err := d.AddRoot(context.Background(), rootDir); err != nil {
+		t.Fatalf("AddRoot: %v", err)
+	}
+	root, err := d.stateDB.RootByHomeRel("notes")
+	if err != nil {
+		t.Fatalf("RootByHomeRel: %v", err)
+	}
+	entries, err := d.stateDB.EntriesForRoot(root.RootID)
+	if err != nil {
+		t.Fatalf("EntriesForRoot: %v", err)
+	}
+	beforeEntry := entries["note.txt"]
+	beforeServerSeq, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+	if err != nil {
+		t.Fatalf("CurrentSeq(before): %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.reconnectLoop(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("reconnect loop did not stop")
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := d.Status()
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		if status.Connection == protocol.ConnectionLive {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	status, err := d.Status()
+	if err != nil || status.Connection != protocol.ConnectionLive {
+		t.Fatalf("client did not become live: status=%+v err=%v", status, err)
+	}
+	oldSession, err := d.stateDB.LoadWorkspaceState()
+	if err != nil {
+		t.Fatalf("LoadWorkspaceState(before 401): %v", err)
+	}
+	if _, err := h.serverDB.SQL.Exec(`UPDATE sessions SET expires_at = ? WHERE workspace_id = ?`, time.Now().UTC().Add(-time.Minute), d.cfg.WorkspaceID); err != nil {
+		t.Fatalf("expire server session: %v", err)
+	}
+	if err := os.WriteFile(file, []byte("after reauthentication\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(after): %v", err)
+	}
+
+	d.syncMu.Lock()
+	d.mu.Lock()
+	rescanErr := d.rescanRootHint(context.Background(), root.RootID, "note.txt")
+	pending, pendingErr := d.stateDB.CountPendingOps()
+	d.mu.Unlock()
+	d.syncMu.Unlock()
+	if rescanErr != nil {
+		t.Fatalf("rescanRootHint after expiry: %v", rescanErr)
+	}
+	if pendingErr != nil || pending != 1 {
+		t.Fatalf("queued ops after 401 = %d err=%v, want 1", pending, pendingErr)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, err = d.stateDB.CountPendingOps()
+		if err != nil {
+			t.Fatalf("CountPendingOps: %v", err)
+		}
+		currentSession, err := d.stateDB.LoadWorkspaceState()
+		if err != nil {
+			t.Fatalf("LoadWorkspaceState(after 401): %v", err)
+		}
+		currentEntries, err := d.stateDB.EntriesForRoot(root.RootID)
+		if err != nil {
+			t.Fatalf("EntriesForRoot(after 401): %v", err)
+		}
+		currentSeq, err := h.serverDB.CurrentSeq(d.cfg.WorkspaceID)
+		if err != nil {
+			t.Fatalf("CurrentSeq(after 401): %v", err)
+		}
+		status, err := d.Status()
+		if err != nil {
+			t.Fatalf("Status(after 401): %v", err)
+		}
+		requestMu.Lock()
+		wsCount := websockets
+		requestMu.Unlock()
+		currentEntry := currentEntries["note.txt"]
+		if pending == 0 && currentSession.SessionToken != "" && currentSession.SessionToken != oldSession.SessionToken && currentEntry.CurrentSeq > beforeEntry.CurrentSeq && currentEntry.ContentSHA256 != beforeEntry.ContentSHA256 && currentSeq > beforeServerSeq && status.Connection == protocol.ConnectionLive && wsCount >= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("queued local change did not flush after HTTP 401 reauthentication")
 }
 
 func TestIntegrationStatusSurfacesScannerWarnings(t *testing.T) {

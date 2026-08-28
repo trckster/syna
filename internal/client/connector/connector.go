@@ -21,6 +21,8 @@ type Client struct {
 	BaseURL    string
 	Token      string
 	HTTPClient *http.Client
+
+	onUnauthorized func(string)
 }
 
 type HTTPError struct {
@@ -56,6 +58,12 @@ func New(baseURL string) *Client {
 func (c *Client) WithToken(token string) *Client {
 	cp := *c
 	cp.Token = token
+	return &cp
+}
+
+func (c *Client) WithUnauthorizedHandler(handler func(token string)) *Client {
+	cp := *c
+	cp.onUnauthorized = handler
 	return &cp
 }
 
@@ -134,7 +142,7 @@ func (c *Client) UploadObject(ctx context.Context, objectID, kind string, plainS
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Syna-Object-Kind", kind)
 	req.Header.Set("X-Syna-Plain-Size", fmt.Sprintf("%d", plainSize))
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -163,7 +171,7 @@ func (c *Client) DownloadObjectTo(ctx context.Context, objectID string, maxBytes
 	}
 	req.Header.Set(protocol.VersionHeader, "1")
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -204,6 +212,7 @@ func (c *Client) DialWS(ctx context.Context) (*websocket.Conn, error) {
 	header.Set("Authorization", "Bearer "+c.Token)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
 	if err != nil && resp != nil {
+		c.reportUnauthorized(resp.StatusCode)
 		defer func() { _ = resp.Body.Close() }()
 		return nil, responseError("open websocket", resp)
 	}
@@ -235,7 +244,7 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -252,6 +261,20 @@ func (c *Client) doJSONRaw(ctx context.Context, method, p string, reqBody any, r
 		return json.NewDecoder(resp.Body).Decode(respBody)
 	}
 	return nil
+}
+
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.HTTPClient.Do(req)
+	if resp != nil {
+		c.reportUnauthorized(resp.StatusCode)
+	}
+	return resp, err
+}
+
+func (c *Client) reportUnauthorized(statusCode int) {
+	if statusCode == http.StatusUnauthorized && c.Token != "" && c.onUnauthorized != nil {
+		c.onUnauthorized(c.Token)
+	}
 }
 
 func responseError(operation string, resp *http.Response) error {
