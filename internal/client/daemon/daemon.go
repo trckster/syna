@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"syna/internal/buildinfo"
 	"syna/internal/client/applier"
 	"syna/internal/client/configstore"
 	"syna/internal/client/connector"
@@ -1065,14 +1066,17 @@ func (d *Daemon) Status() (*protocol.WorkspaceStatus, error) {
 	}
 	pending, _ := d.stateDB.CountPendingOps()
 	warnings, _ := d.stateDB.ListWarnings()
+	executableID, _ := buildinfo.ExecutableID()
 	status := &protocol.WorkspaceStatus{
-		ServerURL:     st.ServerURL,
-		WorkspaceID:   st.WorkspaceID,
-		Connection:    st.ConnectionState,
-		LastServerSeq: st.LastServerSeq,
-		PendingOps:    pending,
-		LastErrorKind: st.LastErrorKind,
-		LastError:     st.LastError,
+		DaemonExecutableID: executableID,
+		DaemonVersion:      buildinfo.String(),
+		ServerURL:          st.ServerURL,
+		WorkspaceID:        st.WorkspaceID,
+		Connection:         st.ConnectionState,
+		LastServerSeq:      st.LastServerSeq,
+		PendingOps:         pending,
+		LastErrorKind:      st.LastErrorKind,
+		LastError:          st.LastError,
 	}
 	if st.LastError != "" {
 		kind := st.LastErrorKind
@@ -1144,7 +1148,7 @@ func (d *Daemon) submitEventForIncarnation(ctx context.Context, rootID, pathID s
 			return nil, &PathConflictError{PathID: pathID}
 		}
 		if apiErr != nil && apiErr.Code != "" {
-			return nil, fmt.Errorf("%s", apiErr.Code)
+			return nil, fmt.Errorf("%s: %w", apiErr.Code, err)
 		}
 		return nil, err
 	}
@@ -1453,12 +1457,18 @@ func (d *Daemon) streamEvents(ctx context.Context, ws *websocket.Conn) error {
 }
 
 func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketStream, token string, renew <-chan time.Time) error {
+	retryTicker := time.NewTicker(time.Second)
+	defer retryTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-renew:
 			return errSessionRenewal
+		case <-retryTicker.C:
+			if err := d.retryLivePendingOps(ctx); err != nil {
+				return err
+			}
 		case rejectedToken := <-d.sessionRejected:
 			if token == "" || rejectedToken != token {
 				continue
@@ -1478,6 +1488,32 @@ func (d *Daemon) consumeWebsocketStream(ctx context.Context, stream *websocketSt
 			}
 		}
 	}
+}
+
+func (d *Daemon) retryLivePendingOps(ctx context.Context) error {
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	pending, err := d.stateDB.CountPendingOps()
+	if err != nil || pending == 0 {
+		return err
+	}
+	if err := d.flushPendingOps(ctx); err != nil {
+		if connector.IsHTTPError(err, http.StatusNotFound, "workspace_not_found") || errors.Is(err, context.Canceled) {
+			return err
+		}
+		return d.stateDB.SetConnectionStateWithKind(protocol.ConnectionDegraded, lifecycleKind(err, protocol.IssueTransport), err.Error())
+	}
+	pending, err = d.stateDB.CountPendingOps()
+	if err != nil || pending != 0 {
+		return err
+	}
+	if err := d.bootstrapOrCatchUp(ctx); err != nil {
+		return err
+	}
+	return d.stateDB.SetConnectionState(protocol.ConnectionLive, "")
 }
 
 func (d *Daemon) bootstrapOrCatchUp(ctx context.Context) error {
@@ -2668,6 +2704,10 @@ func isRetryableSyncError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var httpErr *connector.HTTPError
+	if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500) {
 		return true
 	}
 	message := strings.ToLower(err.Error())

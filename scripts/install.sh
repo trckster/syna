@@ -72,14 +72,22 @@ install_binary() {
 
 restart_user_service_if_present() {
   if command -v systemctl >/dev/null 2>&1 && systemctl --user cat syna.service >/dev/null 2>&1; then
-    if ! systemctl --user daemon-reload; then
-      warn "installed new binary, but could not reload user systemd"
-    fi
-    if systemctl --user restart syna.service; then
-      log "restarted syna user service"
-    else
-      warn "installed new binary, but could not restart syna user service"
-    fi
+    case "$("${INSTALL_DIR}/syna" help 2>/dev/null)" in
+      *"syna service refresh"*)
+        if "${INSTALL_DIR}/syna" service refresh; then
+          log "refreshed and restarted syna user service"
+        else
+          warn "installed new binary, but could not refresh the user service; run '${INSTALL_DIR}/syna service refresh'"
+        fi
+        ;;
+      *)
+        if systemctl --user daemon-reload && systemctl --user restart syna.service; then
+          log "restarted syna user service (legacy client)"
+        else
+          warn "installed new binary, but could not restart the user service"
+        fi
+        ;;
+    esac
   fi
 }
 

@@ -40,6 +40,7 @@ var commands = map[string]commandFunc{
 	"add":        addCommand,
 	"rm":         removeCommand,
 	"status":     statusCommand,
+	"service":    serviceCommand,
 	"uninstall":  uninstallCommand,
 }
 
@@ -209,6 +210,13 @@ func resolvePathArg(input string) (string, error) {
 	return filepath.Abs(input)
 }
 
+func serviceCommand(paths commoncfg.ClientPaths, args []string) error {
+	if len(args) != 1 || args[0] != "refresh" {
+		return errors.New("usage: syna service refresh")
+	}
+	return daemon.RefreshUserService(paths)
+}
+
 func statusCommand(paths commoncfg.ClientPaths, _ []string) error {
 	socket, err := ensureSocket(paths)
 	if err != nil {
@@ -217,6 +225,18 @@ func statusCommand(paths commoncfg.ClientPaths, _ []string) error {
 	var status protocol.WorkspaceStatus
 	if err := agentrpc.Call(socket, "status", nil, &status); err != nil {
 		return err
+	}
+	executableID, idErr := buildinfo.ExecutableID()
+	if idErr != nil {
+		status.Warnings = append(status.Warnings, "could not identify CLI executable: "+idErr.Error())
+	} else if status.DaemonExecutableID == "" {
+		status.Warnings = append(status.Warnings, "cannot verify running daemon executable (older daemon or unavailable executable identity); run `syna service refresh` to restart using this binary")
+	} else if status.DaemonExecutableID != executableID || status.DaemonVersion != buildinfo.String() {
+		running := status.DaemonVersion
+		if running == "" {
+			running = "unknown (older daemon)"
+		}
+		status.Warnings = append(status.Warnings, fmt.Sprintf("running daemon executable (%s) differs from CLI (%s); run `syna service refresh` to restart using this binary", running, buildinfo.String()))
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -267,6 +287,7 @@ func usage() {
   syna add <path>            add a file or directory under $HOME to sync
   syna rm <path>             stop syncing a previously added path
   syna status                print workspace, connection, warning, and root status
+  syna service refresh       refresh the service and restart using this binary
   syna uninstall             remove Syna config, state, daemon, service, and binary
   syna version               print the client version
   syna daemon                run the background daemon
@@ -452,29 +473,36 @@ func removeBinaryPath(path string) error {
 	return nil
 }
 
+var errDaemonNotRunning = errors.New("daemon is not listening")
+
 func ensureSocket(paths commoncfg.ClientPaths) (string, error) {
 	if err := commoncfg.EnsureClientDirs(paths); err != nil {
 		return "", err
 	}
-	if err := probeSocket(paths.SocketFile); err == nil {
-		return paths.SocketFile, nil
-	}
-	_ = os.Remove(paths.SocketFile)
-
 	store := configstore.New(paths)
 	cfg, err := store.LoadConfig()
 	if err != nil {
 		return "", err
 	}
+	probeErr := probeSocket(paths.SocketFile)
+	if probeErr != nil && !errors.Is(probeErr, errDaemonNotRunning) {
+		return "", fmt.Errorf("daemon status probe failed: %w", probeErr)
+	}
+	if cfg.DaemonAutoStart && cfg.ServerURL != "" && cfg.WorkspaceID != "" {
+		if err := daemon.EnsureUserServiceEnabled(paths); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: background service could not be enabled: %v\n", err)
+		}
+	}
+	if probeErr == nil {
+		return paths.SocketFile, nil
+	}
 	if !cfg.DaemonAutoStart {
 		return "", errors.New("daemon socket is absent and auto-start is disabled; run `syna daemon` manually")
 	}
-
 	if err := daemon.StartUserService(paths); err != nil {
 		return "", fmt.Errorf("cannot start Syna daemon with user systemd: %w", err)
 	}
 	if err := waitForSocket(paths.SocketFile, 3*time.Second); err != nil {
-		_ = os.Remove(paths.SocketFile)
 		return "", fmt.Errorf("cannot start Syna daemon with user systemd: service started but daemon did not answer: %w", err)
 	}
 	return paths.SocketFile, nil
@@ -500,6 +528,9 @@ func waitForSocket(socketPath string, timeout time.Duration) error {
 func probeSocket(socketPath string) error {
 	conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+			return fmt.Errorf("%w: %w", errDaemonNotRunning, err)
+		}
 		return err
 	}
 	defer conn.Close()

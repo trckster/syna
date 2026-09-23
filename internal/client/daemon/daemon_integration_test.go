@@ -168,8 +168,9 @@ func (h *restartableHarness) Start(t *testing.T) {
 	h.addr = ln.Addr().String()
 	h.serverURL = "http://" + h.addr
 	h.server = &http.Server{Handler: h.handler}
+	server := h.server
 	go func() {
-		if err := h.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			t.Logf("restartable server stopped: %v", err)
 		}
 	}()
