@@ -224,16 +224,18 @@ type SnapshotPayload struct {
 }
 
 type WorkspaceStatus struct {
-	ServerURL     string          `json:"server_url,omitempty"`
-	WorkspaceID   string          `json:"workspace_id,omitempty"`
-	Connection    ConnectionState `json:"connection_state"`
-	LastServerSeq int64           `json:"last_server_seq"`
-	PendingOps    int64           `json:"pending_ops"`
-	LastErrorKind DaemonIssueKind `json:"last_error_kind,omitempty"`
-	LastError     string          `json:"last_error,omitempty"`
-	Issues        []DaemonIssue   `json:"issues,omitempty"`
-	Warnings      []string        `json:"warnings,omitempty"`
-	TrackedRoots  []RootStatus    `json:"tracked_roots,omitempty"`
+	DaemonExecutableID string          `json:"daemon_executable_id,omitempty"`
+	DaemonVersion      string          `json:"daemon_version,omitempty"`
+	ServerURL          string          `json:"server_url,omitempty"`
+	WorkspaceID        string          `json:"workspace_id,omitempty"`
+	Connection         ConnectionState `json:"connection_state"`
+	LastServerSeq      int64           `json:"last_server_seq"`
+	PendingOps         int64           `json:"pending_ops"`
+	LastErrorKind      DaemonIssueKind `json:"last_error_kind,omitempty"`
+	LastError          string          `json:"last_error,omitempty"`
+	Issues             []DaemonIssue   `json:"issues,omitempty"`
+	Warnings           []string        `json:"warnings,omitempty"`
+	TrackedRoots       []RootStatus    `json:"tracked_roots,omitempty"`
 }
 
 type DaemonIssue struct {

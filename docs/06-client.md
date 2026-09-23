@@ -24,6 +24,9 @@ Rules:
 - if `daemon_auto_start=true`, the CLI must install or refresh `~/.config/systemd/user/syna.service` before starting the daemon
 - when starting the daemon, the CLI must run `systemctl --user daemon-reload` and `systemctl --user start syna.service`
 - after a successful `syna connect <server-url>`, the daemon must run `systemctl --user enable --now syna.service`
+- for an already-configured workspace with `daemon_auto_start=true`, later CLI invocations repair disabled login startup without restarting a reachable daemon
+- only a missing socket or a refused connection permits automatic startup; a failed or timed-out status response must leave the socket intact
+- `syna service refresh` rewrites the unit to use the invoking binary, enables login startup for configured automatic clients, and restarts the service
 - later CLI invocations must first try `~/.local/state/syna/agent.sock`
 - if the socket is absent and `daemon_auto_start=true`, the CLI must use user systemd to start `syna.service` and wait briefly for the socket
 - if user systemd is unavailable while `daemon_auto_start=true`, the CLI must fail clearly and must not launch `syna daemon` directly
@@ -204,6 +207,7 @@ Print:
 - connection state
 - last server sequence
 - number of pending operations
+- running daemon build information (`daemon_version`) and executable fingerprint (`daemon_executable_id`), with a warning when it differs from the CLI or is unavailable from an older daemon
 - tracked roots and their states
 - last error if any
 - unsupported file warnings
@@ -439,6 +443,9 @@ If the network is down:
 - keep local watchers active
 - keep generating local pending operations
 - retry session creation with exponential backoff
+- while the WebSocket is live, check queued operations every second and retry those whose persisted backoff has elapsed, even without new filesystem events or CLI calls
+- queue transient HTTP failures (408, 429, and 5xx) as well as transport failures; preserve HTTP error types from event submissions
+- clear the degraded state after the pending queue drains and HTTP catch-up succeeds
 - on reconnect, upload pending operations in creation order after event catch-up
 
 If incremental catch-up returns `410 resync_required`:

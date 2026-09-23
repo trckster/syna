@@ -690,6 +690,7 @@ state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
 unit="${config_home}/systemd/user/syna.service"
 pid_file="${state_home}/syna/daemon.pid"
 log_file="${state_home}/syna/daemon.log"
+enabled_file="${config_home}/systemd/user/syna.enabled"
 
 start_service() {
   if [ ! -f "$unit" ]; then
@@ -726,8 +727,17 @@ case "$1" in
   daemon-reload)
     exit 0
     ;;
+  is-enabled)
+    test -f "$enabled_file"
+    exit $?
+    ;;
   enable)
+    if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
+      touch "$enabled_file"
+      exit 0
+    fi
     if [ "$#" -eq 3 ] && [ "$2" = "--now" ] && [ "$3" = "syna.service" ]; then
+      touch "$enabled_file"
       start_service
       exit 0
     fi
@@ -746,6 +756,7 @@ case "$1" in
     fi
     ;;
   disable)
+    rm -f "$enabled_file"
     if [ "$#" -eq 2 ] && [ "$2" = "syna.service" ]; then
       exit 0
     fi

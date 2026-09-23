@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"syna/internal/client/configstore"
 	commoncfg "syna/internal/common/config"
 )
 
@@ -30,6 +31,32 @@ func StartUserService(paths commoncfg.ClientPaths) error {
 		return err
 	}
 	return runCommand(exec.Command("systemctl", "--user", "start", "syna.service"))
+}
+
+func EnsureUserServiceEnabled(paths commoncfg.ClientPaths) error {
+	if err := exec.Command("systemctl", "--user", "is-enabled", "--quiet", "syna.service").Run(); err == nil {
+		return nil
+	}
+	if err := installUserServiceUnit(paths); err != nil {
+		return err
+	}
+	return runCommand(exec.Command("systemctl", "--user", "enable", "syna.service"))
+}
+
+func RefreshUserService(paths commoncfg.ClientPaths) error {
+	cfg, err := configstore.New(paths).LoadConfig()
+	if err != nil {
+		return err
+	}
+	if err := installUserServiceUnit(paths); err != nil {
+		return err
+	}
+	if cfg.DaemonAutoStart && cfg.ServerURL != "" && cfg.WorkspaceID != "" {
+		if err := runCommand(exec.Command("systemctl", "--user", "enable", "syna.service")); err != nil {
+			return err
+		}
+	}
+	return runCommand(exec.Command("systemctl", "--user", "restart", "syna.service"))
 }
 
 func installUserServiceUnit(paths commoncfg.ClientPaths) error {

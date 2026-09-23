@@ -249,7 +249,7 @@ Use XDG paths:
 
 `daemon_auto_start` means:
 
-- `true`: CLI commands install or refresh `~/.config/systemd/user/syna.service`, require user systemd for automatic startup, and enable the service for future logins after a successful connect
+- `true`: CLI commands install or refresh `~/.config/systemd/user/syna.service`, require user systemd for automatic startup, and enable the service for future logins after a successful connect or a later invocation for an already-configured workspace
 - `false`: Syna does not enable persistent auto-start on its own
 
 `server_url` and `workspace_id` are `null` or absent after `syna disconnect`.

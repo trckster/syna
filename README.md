@@ -83,6 +83,7 @@ syna rm <path>              Stop syncing a path without deleting local files
 syna status                 Show sync and connection state
 syna uninstall              Remove Syna from this client
 syna version                Show client version
+syna service refresh        Refresh and restart the user service
 syna help                   Show command help
 ```
 
@@ -97,6 +98,25 @@ On systems with user systemd, the daemon is managed as:
 ```bash
 systemctl --user status syna.service
 ```
+
+## Upgrading the client
+
+The installer refreshes an existing user service to point to the newly installed
+binary and restarts it. For a configured workspace with `daemon_auto_start=true`,
+it also restores startup at the next login.
+
+After manually installing or building a new client, run that binary explicitly:
+
+```bash
+/path/to/new/syna service refresh
+/path/to/new/syna status
+```
+
+`status` includes the running daemon's build information and executable fingerprint
+and warns if it differs from the CLI, including for development builds. Pulling source or replacing a binary alone does not update an
+already-running daemon. `service refresh` restarts the service, so active transfers
+may be retried. Clients with `daemon_auto_start=false` are not automatically enabled
+for future logins.
 
 ## Uninstall
 

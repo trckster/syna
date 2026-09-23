@@ -42,6 +42,9 @@ The supported v1 lifecycle is:
 - when `daemon_auto_start=true`, the CLI must install or refresh that unit in `~/.config/systemd/user/` before starting the daemon
 - when starting the daemon, the CLI must run `systemctl --user daemon-reload` and `systemctl --user start syna.service`
 - after a successful `syna connect <server-url>`, the daemon must run `systemctl --user enable --now syna.service`
+- for an already-configured workspace with `daemon_auto_start=true`, later CLI invocations repair disabled login startup without restarting a reachable daemon
+- only a missing socket or a refused connection permits automatic startup; a failed or timed-out status response must leave the socket intact
+- `syna service refresh` rewrites the unit to use the invoking binary, enables login startup for configured automatic clients, and restarts the service
 - later CLI invocations must connect to `~/.local/state/syna/agent.sock`
 - if the socket is absent and `daemon_auto_start=true`, the CLI must use user systemd to start `syna.service` and wait for the socket to appear
 - if user systemd is unavailable while `daemon_auto_start=true`, the CLI must fail with a clear fatal message and must not launch `syna daemon` directly
