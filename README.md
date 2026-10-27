@@ -154,7 +154,7 @@ reverse-proxy, backup, restore, and upgrade guidance.
 
 ## Development
 
-Local development requires Linux, Go `1.26.6`, CGO-enabled SQLite build support,
+Local development requires Linux, Go `1.27.3`, CGO-enabled SQLite build support,
 and a C compiler such as `build-essential` on Debian or Ubuntu. For Linux ARM64
 release archives, install `gcc-aarch64-linux-gnu` as well.
 
