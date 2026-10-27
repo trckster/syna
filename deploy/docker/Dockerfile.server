@@ -1,6 +1,9 @@
-FROM golang:1.26.6-alpine AS build
+FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS build
 
 RUN apk add --no-cache build-base
+
+ARG GO_BUILD_PARALLELISM=2
+ENV GOMAXPROCS=${GO_BUILD_PARALLELISM}
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -10,11 +13,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -p "${GO_BUILD_PARALLELISM}" -trimpath -buildvcs=false \
 	-ldflags "-X syna/internal/buildinfo.Version=${VERSION} -X syna/internal/buildinfo.Commit=${COMMIT} -X syna/internal/buildinfo.BuildDate=${BUILD_DATE}" \
 	-o /out/syna-server ./cmd/syna-server
 
-FROM alpine:3.22
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 RUN adduser -D -u 10001 syna \
 	&& apk add --no-cache ca-certificates curl sqlite
