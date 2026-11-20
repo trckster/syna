@@ -70,6 +70,13 @@ syna connect https://syna.example.com
 
 Enter the recovery key from the first device when prompted.
 
+When joining an existing workspace, `syna connect` shows a progress bar in the
+terminal while restoring folders and files and applying remaining changes. The
+percentage is an estimate weighted by sync phase and folder, using restored bytes
+and entries within each folder; it reaches 100% when the initial sync completes.
+File and byte counts refer to the current folder or file. Progress is written to
+stderr only when it is a terminal, so redirected output stays free of animation.
+
 ## Client Commands
 
 ```text

@@ -22,6 +22,8 @@ import (
 
 type ApplyOptions struct {
 	StageOnly bool
+	// OnProgress reports plaintext bytes restored for the current file.
+	OnProgress func(path string, doneBytes, totalBytes int64)
 }
 
 type IntegrityError struct {
@@ -134,6 +136,9 @@ func ApplyEvent(ctx context.Context, conn *connector.Client, keys *commoncrypto.
 					return &IntegrityError{Message: "rejected remote file_put with inconsistent chunk size"}
 				}
 				total += n
+				if opts.OnProgress != nil {
+					opts.OnProgress(payload.Path, total, payload.SizeBytes)
+				}
 			}
 			if total != payload.SizeBytes {
 				tmp.Close()

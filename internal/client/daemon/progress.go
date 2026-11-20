@@ -9,6 +9,7 @@ import (
 
 type AddProgress struct {
 	Stage        string
+	Fraction     *float64
 	Message      string
 	Path         string
 	DoneBytes    int64

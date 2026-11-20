@@ -12,13 +12,14 @@ import (
 )
 
 type addProgressRenderer struct {
-	w        io.Writer
-	enabled  bool
-	started  time.Time
-	frame    int
-	lastDraw time.Time
-	drew     bool
-	done     bool
+	w         io.Writer
+	enabled   bool
+	started   time.Time
+	frame     int
+	lastDraw  time.Time
+	drew      bool
+	done      bool
+	lastStage string
 }
 
 func newAddProgressRenderer(w *os.File) *addProgressRenderer {
@@ -56,7 +57,7 @@ func (r *addProgressRenderer) Done(err error) {
 }
 
 func (r *addProgressRenderer) shouldDraw(progress agentrpc.Progress, now time.Time) bool {
-	if !r.drew || progress.Stage == "done" || progress.Stage == "finalizing" || progress.Stage == "scanning" {
+	if !r.drew || progress.Stage != r.lastStage || progress.Stage == "done" || progress.Stage == "finalizing" || progress.Stage == "scanning" {
 		return true
 	}
 	return now.Sub(r.lastDraw) >= 100*time.Millisecond
@@ -73,6 +74,9 @@ func (r *addProgressRenderer) draw(progress agentrpc.Progress, now time.Time) {
 	title := progressTitle(progress.Stage)
 
 	line := fmt.Sprintf("%s %c [%s] %3d%%", title, spinner, bar, percent)
+	if progress.Fraction != nil && progress.Stage != "done" {
+		line = fmt.Sprintf("%s %c [%s] ~%2d%%", title, spinner, bar, percent)
+	}
 	if progress.TotalBytes > 0 {
 		line += fmt.Sprintf("  %s/%s", formatBytes(progress.DoneBytes), formatBytes(progress.TotalBytes))
 	}
@@ -92,6 +96,7 @@ func (r *addProgressRenderer) draw(progress agentrpc.Progress, now time.Time) {
 
 	fmt.Fprintf(r.w, "\r\x1b[2K%s", line)
 	r.lastDraw = now
+	r.lastStage = progress.Stage
 	r.drew = true
 	if progress.Stage == "done" {
 		r.done = true
@@ -101,6 +106,14 @@ func (r *addProgressRenderer) draw(progress agentrpc.Progress, now time.Time) {
 
 func progressTitle(stage string) string {
 	switch stage {
+	case "connecting":
+		return "Connecting"
+	case "preparing":
+		return "Preparing "
+	case "downloading":
+		return "Restoring "
+	case "catching_up":
+		return "Catching up"
 	case "scanning":
 		return "Scanning "
 	case "finalizing":
@@ -117,7 +130,11 @@ func progressFraction(progress agentrpc.Progress) float64 {
 		return 1
 	}
 	var fraction float64
-	if progress.TotalBytes > 0 {
+	if progress.Fraction != nil {
+		// Connect reports a phase-weighted estimate. Reserve 100% for success,
+		// including after rounding the percentage for display.
+		fraction = math.Min(*progress.Fraction, 0.99)
+	} else if progress.TotalBytes > 0 {
 		fraction = float64(progress.DoneBytes) / float64(progress.TotalBytes)
 	} else if progress.TotalEntries > 0 {
 		fraction = float64(progress.DoneEntries) / float64(progress.TotalEntries)
@@ -146,7 +163,7 @@ func progressBar(fraction float64, width int) string {
 }
 
 func progressETA(progress agentrpc.Progress, elapsed time.Duration) string {
-	if progress.Stage == "scanning" || progress.Stage == "done" {
+	if progress.Stage == "scanning" || progress.Stage == "done" || progress.Fraction != nil {
 		return ""
 	}
 	fraction := progressFraction(progress)

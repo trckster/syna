@@ -24,6 +24,7 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		}
 		_ = enc.Encode(agentrpc.Response{OK: true, Progress: &agentrpc.Progress{
 			Stage:        progress.Stage,
+			Fraction:     progress.Fraction,
 			Message:      progress.Message,
 			Path:         progress.Path,
 			DoneBytes:    progress.DoneBytes,
@@ -54,7 +55,7 @@ func (d *Daemon) dispatchRPC(req agentrpc.Request, progress AddProgressFunc) (an
 		if err := json.Unmarshal(req.Params, &args); err != nil {
 			return nil, err
 		}
-		return d.Connect(context.Background(), args)
+		return d.ConnectWithProgress(context.Background(), args, progress)
 	case "disconnect":
 		return d.DisconnectWithResponse(context.Background())
 	case "add":

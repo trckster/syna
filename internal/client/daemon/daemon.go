@@ -262,8 +262,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectResponse, error) {
+	return d.ConnectWithProgress(ctx, req, nil)
+}
+
+func (d *Daemon) ConnectWithProgress(ctx context.Context, req ConnectRequest, progress AddProgressFunc) (*ConnectResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	var tracker *connectProgress
+	if progress != nil {
+		tracker = &connectProgress{emit: progress}
+		ctx = context.WithValue(ctx, connectProgressKey{}, tracker)
+	}
+	tracker.report(0, AddProgress{Stage: "connecting", Message: "authenticating with server"})
 	if d.purgeTransition {
 		return nil, errors.New("workspace purge transition is still being finalized")
 	}
@@ -348,6 +358,7 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 	}); err != nil {
 		return nil, err
 	}
+	tracker.report(0.02, AddProgress{Stage: "preparing", Message: "preparing initial sync"})
 	var warnings []string
 	if d.cfg.DaemonAutoStart {
 		if err := d.installUserService(); err != nil {
@@ -364,8 +375,10 @@ func (d *Daemon) Connect(ctx context.Context, req ConnectRequest) (*ConnectRespo
 			return nil, err
 		}
 	}
+	tracker.report(0.99, AddProgress{Stage: "finalizing", Message: "starting background sync"})
 	d.intentionalDisconnect = false
 	d.startReconnectLoopLocked()
+	tracker.report(1, AddProgress{Stage: "done", Message: "initial sync complete"})
 	return &ConnectResponse{
 		WorkspaceID:          workspaceID,
 		GeneratedRecoveryKey: map[bool]string{true: displayKey, false: ""}[generatedKey],
@@ -1517,6 +1530,7 @@ func (d *Daemon) retryLivePendingOps(ctx context.Context) error {
 }
 
 func (d *Daemon) bootstrapOrCatchUp(ctx context.Context) error {
+	progress := connectProgressFrom(ctx)
 	for {
 		st, err := d.stateDB.LoadWorkspaceState()
 		if err != nil {
@@ -1529,10 +1543,13 @@ func (d *Daemon) bootstrapOrCatchUp(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		progress.startCatchUp(st.LastServerSeq, resp.CurrentSeq)
 		for _, event := range resp.Events {
+			progress.startEvent(event.Seq)
 			if err := d.consumeRemoteEvent(ctx, event); err != nil {
 				return err
 			}
+			progress.finishEvent(event.Seq)
 		}
 		if len(resp.Events) == 0 {
 			if st.LastServerSeq < resp.CurrentSeq {
@@ -1547,12 +1564,20 @@ func (d *Daemon) bootstrapOrCatchUp(ctx context.Context) error {
 }
 
 func (d *Daemon) bootstrap(ctx context.Context) error {
+	progress := connectProgressFrom(ctx)
+	progress.report(0.02, AddProgress{Stage: "preparing", Message: "fetching workspace metadata"})
 	resp, err := d.conn.Bootstrap(ctx)
 	if err != nil {
 		return err
 	}
 	remoteRootIDs := make(map[string]struct{}, len(resp.Roots))
+	snapshotCount := progress.planRoots(resp.Roots)
+	snapshotIndex := 0
 	for _, root := range resp.Roots {
+		if root.LatestSnapshotObjectID != "" && root.LatestSnapshotSeq > 0 {
+			progress.startRoot(snapshotIndex, snapshotCount)
+			snapshotIndex++
+		}
 		remoteRootIDs[root.RootID] = struct{}{}
 		if _, err := d.ensureRootFromDescriptor(root); err != nil {
 			var integrityErr *applier.IntegrityError
@@ -1597,10 +1622,12 @@ func (d *Daemon) bootstrap(ctx context.Context) error {
 	if err := d.stateDB.ResetLastSeq(resp.BootstrapAfterSeq); err != nil {
 		return err
 	}
+	progress.startCatchUp(resp.BootstrapAfterSeq, resp.CurrentSeq)
 	if err := d.bootstrapOrCatchUp(ctx); err != nil {
 		return err
 	}
 	roots, _ := d.stateDB.ListRoots()
+	progress.report(0.99, AddProgress{Stage: "finalizing", Message: "watching synced folders"})
 	for _, root := range roots {
 		if root.State == protocol.RootStateActive && !d.isRootStaged(root.RootID) {
 			d.addWatcherRoot(root.RootID, root.TargetAbsPath)
@@ -1791,7 +1818,13 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 			return nil
 		}
 		staged := d.isRootStaged(root.RootID)
-		if err := applier.ApplyEvent(ctx, d.conn, d.keys, d.cfg.WorkspaceID, *root, event, d.stateDB, applier.ApplyOptions{StageOnly: staged}); err != nil {
+		opts := applier.ApplyOptions{StageOnly: staged}
+		if progress := connectProgressFrom(ctx); progress != nil {
+			opts.OnProgress = func(relPath string, doneBytes, totalBytes int64) {
+				progress.eventBytes(displaySyncPath(root.HomeRelPath, relPath), doneBytes, totalBytes)
+			}
+		}
+		if err := applier.ApplyEvent(ctx, d.conn, d.keys, d.cfg.WorkspaceID, *root, event, d.stateDB, opts); err != nil {
 			var integrityErr *applier.IntegrityError
 			if errors.As(err, &integrityErr) {
 				d.logRemoteIntegrityError(event, integrityErr)
