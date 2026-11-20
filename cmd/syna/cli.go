@@ -108,7 +108,10 @@ func connectCommand(paths commoncfg.ClientPaths, args []string) error {
 		req.RecoveryKey = strings.TrimSpace(line)
 	}
 	var resp daemon.ConnectResponse
-	if err := agentrpc.Call(socket, "connect", req, &resp); err != nil {
+	progress := newAddProgressRenderer(os.Stderr)
+	err = agentrpc.CallWithProgress(socket, "connect", req, &resp, progress.Update)
+	progress.Done(err)
+	if err != nil {
 		return err
 	}
 	if resp.GeneratedRecoveryKey != "" {

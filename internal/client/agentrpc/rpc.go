@@ -23,15 +23,16 @@ type Response struct {
 }
 
 type Progress struct {
-	Stage        string `json:"stage"`
-	Message      string `json:"message,omitempty"`
-	Path         string `json:"path,omitempty"`
-	DoneBytes    int64  `json:"done_bytes,omitempty"`
-	TotalBytes   int64  `json:"total_bytes,omitempty"`
-	DoneFiles    int    `json:"done_files,omitempty"`
-	TotalFiles   int    `json:"total_files,omitempty"`
-	DoneEntries  int    `json:"done_entries,omitempty"`
-	TotalEntries int    `json:"total_entries,omitempty"`
+	Stage        string   `json:"stage"`
+	Fraction     *float64 `json:"fraction,omitempty"`
+	Message      string   `json:"message,omitempty"`
+	Path         string   `json:"path,omitempty"`
+	DoneBytes    int64    `json:"done_bytes,omitempty"`
+	TotalBytes   int64    `json:"total_bytes,omitempty"`
+	DoneFiles    int      `json:"done_files,omitempty"`
+	TotalFiles   int      `json:"total_files,omitempty"`
+	DoneEntries  int      `json:"done_entries,omitempty"`
+	TotalEntries int      `json:"total_entries,omitempty"`
 }
 
 func Call(socketPath, method string, req any, resp any) error {

@@ -54,6 +54,8 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 	if homeRel != root.HomeRelPath || commoncrypto.RootID(d.keys, homeRel) != root.RootID {
 		return &applier.IntegrityError{Message: "rejected snapshot with invalid root binding"}
 	}
+	progress := connectProgressFrom(ctx)
+	progress.planSnapshot(snapshot)
 	var priorEntries map[string]state.Entry
 	if !stageOnly {
 		priorEntries, err = d.stateDB.EntriesForRoot(root.RootID)
@@ -63,6 +65,7 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 	}
 	var entries []state.Entry
 	for _, entry := range snapshot.Entries {
+		var downloadedBytes int64
 		relPath, target, pathID, err := d.resolveSnapshotTarget(root, entry.Path, entry.Kind)
 		if err != nil {
 			return err
@@ -159,6 +162,8 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 						return &applier.IntegrityError{Message: "rejected snapshot with inconsistent chunk size"}
 					}
 					total += n
+					downloadedBytes += n
+					progress.snapshotBytes(n, displaySyncPath(root.HomeRelPath, relPath))
 				}
 				if total != entry.SizeBytes {
 					tmp.Close()
@@ -210,6 +215,11 @@ func (d *Daemon) applySnapshot(ctx context.Context, root state.Root, objectID st
 				MTimeNS:       entry.MTimeNS,
 			})
 		}
+		remainingBytes := int64(0)
+		if entry.Kind == protocol.RootKindFile {
+			remainingBytes = entry.SizeBytes - downloadedBytes
+		}
+		progress.finishSnapshotEntry(entry, remainingBytes, displaySyncPath(root.HomeRelPath, relPath))
 	}
 	return d.stateDB.ReplaceEntries(root.RootID, entries)
 }
