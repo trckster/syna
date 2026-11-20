@@ -16,7 +16,7 @@ import (
 )
 
 func TestConnectRPCProgress(t *testing.T) {
-	for _, scenario := range []string{"snapshots", "event replay", "empty workspace", "empty files and directories", "download failure"} {
+	for _, scenario := range []string{"snapshots", "event replay", "file root replay", "empty workspace", "empty files and directories", "download failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			h := newIntegrationHarnessWithMaxEventFetchPage(t, 2)
 			defer h.Close()
@@ -32,13 +32,21 @@ func TestConnectRPCProgress(t *testing.T) {
 			if scenario == "empty files and directories" {
 				contents = nil
 			}
+			roots := []string{"notes", "docs"}
+			files := []string{"notes/file", "docs/file"}
+			if scenario == "file root replay" {
+				roots = []string{"standalone"}
+				files = []string{"standalone"}
+			}
 			if scenario != "empty workspace" {
-				for _, name := range []string{"notes", "docs"} {
+				for i, name := range roots {
 					root := filepath.Join(home1, name)
-					if err := os.MkdirAll(filepath.Join(root, "empty"), 0o755); err != nil {
-						t.Fatal(err)
+					if scenario != "file root replay" {
+						if err := os.MkdirAll(filepath.Join(root, "empty"), 0o755); err != nil {
+							t.Fatal(err)
+						}
 					}
-					if err := os.WriteFile(filepath.Join(root, "file"), contents, 0o644); err != nil {
+					if err := os.WriteFile(filepath.Join(home1, files[i]), contents, 0o644); err != nil {
 						t.Fatal(err)
 					}
 					if err := first.AddRoot(context.Background(), root); err != nil {
@@ -46,7 +54,8 @@ func TestConnectRPCProgress(t *testing.T) {
 					}
 				}
 			}
-			if scenario == "event replay" {
+			replayOnly := scenario == "event replay" || scenario == "file root replay"
+			if replayOnly {
 				// Simulate a workspace whose initial events are still retained
 				// and have not yet been covered by snapshots.
 				if _, err := h.serverDB.SQL.Exec(`UPDATE roots SET latest_snapshot_object_id = NULL, latest_snapshot_seq = NULL`); err != nil {
@@ -68,7 +77,7 @@ func TestConnectRPCProgress(t *testing.T) {
 
 			// Exercise the real daemon RPC stream, including its final response.
 			client, server := net.Pipe()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			_ = client.SetDeadline(time.Now().Add(30 * time.Second))
 			go second.handleConn(server)
 			if err := json.NewEncoder(client).Encode(agentrpc.Request{
@@ -95,6 +104,7 @@ func TestConnectRPCProgress(t *testing.T) {
 			}
 			previous := 0.0
 			chunkProgress, entryProgress := false, false
+			replayPaths := make(map[string]bool)
 			for _, update := range updates {
 				if update.Fraction == nil || *update.Fraction < previous || *update.Fraction > 1 {
 					t.Fatalf("invalid or regressing progress: %+v (previous %f)", update, previous)
@@ -105,6 +115,9 @@ func TestConnectRPCProgress(t *testing.T) {
 				}
 				if update.DoneBytes > 0 && update.DoneBytes < update.TotalBytes {
 					chunkProgress = true
+					if update.Stage == "catching_up" {
+						replayPaths[update.Path] = true
+					}
 				}
 				if update.Stage == "downloading" && update.TotalEntries > 0 && update.DoneEntries == update.TotalEntries {
 					entryProgress = true
@@ -127,14 +140,17 @@ func TestConnectRPCProgress(t *testing.T) {
 			if scenario == "empty workspace" {
 				return
 			}
-			if (scenario == "snapshots" || scenario == "event replay") && !chunkProgress {
+			if (scenario == "snapshots" || replayOnly) && !chunkProgress {
 				t.Fatal("missing progress during a multi-chunk file download")
 			}
 			if scenario == "empty files and directories" && !entryProgress {
 				t.Fatal("zero-byte entries did not advance progress")
 			}
-			for _, name := range []string{"notes", "docs"} {
-				got, err := os.ReadFile(filepath.Join(home2, name, "file"))
+			for _, name := range files {
+				if replayOnly && !replayPaths[name] {
+					t.Errorf("replay progress missing workspace-relative path %q; got %v", name, replayPaths)
+				}
+				got, err := os.ReadFile(filepath.Join(home2, name))
 				if err != nil || !bytes.Equal(got, contents) {
 					t.Fatalf("restored %s differs, err = %v", name, err)
 				}

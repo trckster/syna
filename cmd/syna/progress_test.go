@@ -65,7 +65,7 @@ func TestConnectProgressRendererFailureAndRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	redirected := newAddProgressRenderer(w)
 	redirected.Update(agentrpc.Progress{Stage: "done"})
 	redirected.Done(nil)

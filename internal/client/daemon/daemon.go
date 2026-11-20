@@ -1820,7 +1820,9 @@ func (d *Daemon) applyRemoteEvent(ctx context.Context, event protocol.EventRecor
 		staged := d.isRootStaged(root.RootID)
 		opts := applier.ApplyOptions{StageOnly: staged}
 		if progress := connectProgressFrom(ctx); progress != nil {
-			opts.OnProgress = progress.eventBytes
+			opts.OnProgress = func(relPath string, doneBytes, totalBytes int64) {
+				progress.eventBytes(displaySyncPath(root.HomeRelPath, relPath), doneBytes, totalBytes)
+			}
 		}
 		if err := applier.ApplyEvent(ctx, d.conn, d.keys, d.cfg.WorkspaceID, *root, event, d.stateDB, opts); err != nil {
 			var integrityErr *applier.IntegrityError
